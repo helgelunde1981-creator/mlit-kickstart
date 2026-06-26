@@ -1,0 +1,108 @@
+﻿#!/usr/bin/env node
+/**
+ * CMS Coverage Check — finn hardkodet kundetekst i public-side-komponenter.
+ *
+ * Hvis et stort tekstområde (>3 ord) finnes som string literal i en
+ * komponent som rendres på public-ruter, anses det som hardkodet —
+ * det skal komme fra CMS.
+ *
+ * Tillatte unntak:
+ *  - Strings i `data-testid`, `aria-label`, `className`
+ *  - Footer-credit «Utviklet av Myrvoll-Lunde IT Drift»
+ *  - Strings under `src/lib/seo/` (JSON-LD-konstanter)
+ *  - Strings i komponenter under `src/components/admin/`
+ *
+ * Kjør: pnpm tsx scripts/check-cms-coverage.ts
+ */
+
+import { readFileSync } from 'node:fs'
+import { glob } from 'glob'
+import path from 'node:path'
+
+interface Finding {
+  file: string
+  line: number
+  text: string
+}
+
+const PUBLIC_DIRS = [
+  'src/app/(public)/**/*.{tsx,ts}',
+  'src/app/(site)/**/*.{tsx,ts}',
+  'src/components/public/**/*.{tsx,ts}',
+  'src/components/marketing/**/*.{tsx,ts}',
+  'src/components/site/**/*.{tsx,ts}',
+]
+
+const EXCLUDED_PATTERNS = [
+  /^Utviklet av Myrvoll-Lunde IT Drift$/,
+  /^\d+$/,
+  /^[A-Z_]+$/,
+  /^[a-z-]+$/,
+  /^https?:\/\//,
+  /^\/[a-z-/]+$/,
+]
+
+const STRING_RE = /(?:"|')([^"']{15,})(?:"|')/g
+
+async function findHardcodedText(): Promise<Finding[]> {
+  const findings: Finding[] = []
+
+  for (const pattern of PUBLIC_DIRS) {
+    const files = await glob(pattern, { ignore: ['**/*.test.*', '**/*.spec.*'] })
+
+    for (const file of files) {
+      const content = readFileSync(file, 'utf-8')
+      const lines = content.split('\n')
+
+      lines.forEach((line, idx) => {
+        if (/^\s*(import|\/\/|\*|<)/.test(line)) return
+        if (/(className|data-testid|aria-label|placeholder=\{?["']?[a-z-]+["']?\}?|alt=\{)/.test(line)) return
+
+        for (const match of line.matchAll(STRING_RE)) {
+          const text = match[1].trim()
+          if (EXCLUDED_PATTERNS.some((p) => p.test(text))) continue
+          if (text.split(/\s+/).length < 4) continue
+          findings.push({ file, line: idx + 1, text })
+        }
+      })
+    }
+  }
+
+  return findings
+}
+
+async function main(): Promise<void> {
+  const findings = await findHardcodedText()
+
+  const report = {
+    timestamp: new Date().toISOString(),
+    total: findings.length,
+    findings,
+    passed: findings.length === 0,
+  }
+
+  const outDir = path.join(process.cwd(), 'reports')
+  const fs = await import('node:fs/promises')
+  await fs.mkdir(outDir, { recursive: true })
+  await fs.writeFile(path.join(outDir, 'cms-coverage.json'), JSON.stringify(report, null, 2))
+
+  if (findings.length === 0) {
+    console.log('✓ CMS-coverage OK — 0 hardkodet kundetekst funnet')
+    console.log(`Bevis: scannet ${PUBLIC_DIRS.length} mappe-mønstre`)
+    return
+  }
+
+  console.error(`✗ CMS-coverage FAILED — ${findings.length} hardkodet streng funnet`)
+  for (const f of findings.slice(0, 20)) {
+    console.error(`  ${f.file}:${f.line}  "${f.text.slice(0, 80)}"`)
+  }
+  if (findings.length > 20) {
+    console.error(`  ... og ${findings.length - 20} til (se reports/cms-coverage.json)`)
+  }
+  process.exit(1)
+}
+
+main().catch((e) => {
+  console.error('check-cms-coverage crashed:', e)
+  process.exit(2)
+})

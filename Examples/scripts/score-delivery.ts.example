@@ -1,0 +1,145 @@
+#!/usr/bin/env node
+/**
+ * Delivery Score — leser alle reports/*.json og bygger en
+ * sammensatt 10/10-rapport. Lagrer til delivery_scores-tabellen
+ * for historikk.
+ *
+ * Kjør: pnpm tsx scripts/score-delivery.ts
+ */
+
+import { readFile, writeFile, mkdir } from 'node:fs/promises'
+import path from 'node:path'
+
+interface DimensionScore {
+  dimension: string
+  score: number  // 0-10
+  passed: boolean
+  detail: string
+}
+
+async function readReport(name: string): Promise<Record<string, unknown> | null> {
+  try {
+    const content = await readFile(path.join('reports', name), 'utf-8')
+    return JSON.parse(content)
+  } catch {
+    return null
+  }
+}
+
+function scoreLighthouse(report: Record<string, unknown> | null): DimensionScore[] {
+  if (!report) {
+    return [
+      { dimension: 'lighthouse-performance', score: 0, passed: false, detail: 'report missing' },
+      { dimension: 'lighthouse-accessibility', score: 0, passed: false, detail: 'report missing' },
+      { dimension: 'lighthouse-best-practices', score: 0, passed: false, detail: 'report missing' },
+      { dimension: 'lighthouse-seo', score: 0, passed: false, detail: 'report missing' },
+    ]
+  }
+  const results = (report.results as Array<Record<string, number>>) ?? []
+  const avg = (key: string) =>
+    results.length === 0 ? 0 : results.reduce((sum, r) => sum + (r[key] ?? 0), 0) / results.length
+
+  const toScore = (avgValue: number) => Math.round((avgValue / 100) * 10 * 10) / 10
+  const dims: DimensionScore[] = []
+  for (const k of ['performance', 'accessibility', 'bestPractices', 'seo']) {
+    const a = avg(k)
+    dims.push({
+      dimension: `lighthouse-${k}`,
+      score: toScore(a),
+      passed: a >= 95,
+      detail: `avg ${a.toFixed(1)} on ${results.length} routes`,
+    })
+  }
+  return dims
+}
+
+function scoreBool(report: Record<string, unknown> | null, dim: string, label: string): DimensionScore {
+  if (!report) return { dimension: dim, score: 0, passed: false, detail: 'report missing' }
+  const passed = report.passed === true
+  return {
+    dimension: dim,
+    score: passed ? 10 : 0,
+    passed,
+    detail: passed ? `${label} OK` : `${label} failed (${(report.failed as number) ?? '?'} failures)`,
+  }
+}
+
+async function main(): Promise<void> {
+  const [lighthouse, a11y, cms, footer, links, emails] = await Promise.all([
+    readReport('lighthouse/summary.json'),
+    readReport('a11y/summary.json'),
+    readReport('cms-coverage.json'),
+    readReport('footer-credit.json'),
+    readReport('broken-links.json'),
+    readReport('email-rendering.json'),
+  ])
+
+  const dimensions: DimensionScore[] = [
+    ...scoreLighthouse(lighthouse),
+    scoreBool(a11y, 'a11y', 'A11y (axe-core)'),
+    scoreBool(cms, 'cms-coverage', 'CMS-coverage'),
+    scoreBool(footer, 'footer-credit', 'Footer-credit'),
+    scoreBool(links, 'broken-links', 'Broken links'),
+    scoreBool(emails, 'email-rendering', 'Email rendering'),
+  ]
+
+  const overall = dimensions.reduce((sum, d) => sum + d.score, 0) / dimensions.length
+  const overallPassed = dimensions.every((d) => d.passed)
+
+  // Generate markdown for PR comment
+  const md = [
+    '## 📊 Delivery Score',
+    '',
+    `**Overall:** ${overall.toFixed(1)} / 10 ${overallPassed ? '✅' : '⚠️'}`,
+    '',
+    '| Dimensjon | Score | Status | Detalj |',
+    '|-----------|-------|--------|--------|',
+    ...dimensions.map(
+      (d) => `| ${d.dimension} | ${d.score.toFixed(1)} | ${d.passed ? '✅' : '❌'} | ${d.detail} |`
+    ),
+    '',
+    overallPassed
+      ? '> Alle dimensjoner over terskel — klar for merge.'
+      : '> En eller flere dimensjoner under terskel — fiks før merge.',
+  ].join('\n')
+
+  await mkdir('reports', { recursive: true })
+  await writeFile('reports/delivery-score.md', md)
+
+  // Persist to Supabase if creds available
+  const supabaseUrl = process.env.SUPABASE_URL
+  const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY
+  const sha = process.env.GITHUB_SHA ?? 'local'
+  const prNum = process.env.GITHUB_PR_NUMBER ?? null
+
+  if (supabaseUrl && supabaseKey) {
+    try {
+      await fetch(`${supabaseUrl}/rest/v1/delivery_scores`, {
+        method: 'POST',
+        headers: {
+          apikey: supabaseKey,
+          Authorization: `Bearer ${supabaseKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          commit_sha: sha,
+          pr_number: prNum,
+          overall_score: overall,
+          dimensions,
+          passed: overallPassed,
+        }),
+      })
+    } catch (e) {
+      console.warn('Failed to persist delivery score to Supabase:', e)
+    }
+  }
+
+  console.log(md)
+
+  if (!overallPassed) process.exit(1)
+}
+
+main().catch((e) => {
+  console.error('score-delivery crashed:', e)
+  process.exit(2)
+})

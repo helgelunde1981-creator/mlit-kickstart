@@ -1,0 +1,104 @@
+# Quality Gate — kjører på hver PR til main + hver push til dev/main
+# Blokkerer merge hvis 10/10-tersklene fra docs/standards/04-QUALITY_GATES.md ikke nås.
+#
+# Kopier til .github/workflows/quality-gate.yml i kunde-prosjektet.
+
+name: Quality Gate (10/10)
+
+on:
+  pull_request:
+    branches: [main, dev]
+  push:
+    branches: [main, dev]
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'pnpm'
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Start server (background)
+        run: pnpm start &
+        env:
+          NODE_ENV: production
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+
+      - name: Wait for server
+        run: npx wait-on http://localhost:3000 --timeout 60000
+
+      - name: CMS coverage (anti-hardkoding)
+        run: pnpm check:cms-coverage
+        # Feiler tidlig — ingen poeng i å kjøre Lighthouse om CMS er ikke ferdig
+
+      - name: Footer credit
+        run: pnpm check:footer-credit
+
+      - name: Broken links
+        run: pnpm check:broken-links
+
+      - name: Email rendering
+        run: pnpm check:email-rendering
+
+      - name: Lighthouse
+        run: pnpm check:lighthouse
+        env:
+          BASE_URL: http://localhost:3000
+
+      - name: A11y (axe-core)
+        run: pnpm check:a11y
+        env:
+          BASE_URL: http://localhost:3000
+
+      - name: Score delivery
+        id: score
+        run: pnpm score:delivery
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
+          GITHUB_SHA: ${{ github.sha }}
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-reports
+          path: |
+            reports/lighthouse/*.html
+            reports/a11y/*.json
+            reports/cms-coverage.json
+            reports/delivery-score.md
+
+      - name: Comment PR with delivery score
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs')
+            const body = fs.readFileSync('reports/delivery-score.md', 'utf-8')
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            })

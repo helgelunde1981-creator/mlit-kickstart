@@ -1,0 +1,189 @@
+/**
+ * generate-seo-grid-content.ts — fyller service_locations.intro + .faq
+ * med unikt SEO-innhold per kombinasjon via Claude API tool-use.
+ *
+ * Mål: ≥800 ord per side (intro ~250 ord + 6 FAQ × 80 ord = ~730 ord
+ *      + page-skall ~80 ord = 810).
+ *
+ * Kjør:
+ *   set -a && source .env.local && set +a && \
+ *   pnpm tsx scripts/generate-seo-grid-content.ts
+ *
+ * Idempotent: hopper over rader som allerede har content (med mindre --force).
+ */
+import { createClient } from "@supabase/supabase-js";
+import Anthropic from "@anthropic-ai/sdk";
+
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL?.trim();
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY?.trim();
+const FORCE = process.argv.includes("--force");
+
+if (!SUPABASE_URL || !SUPABASE_KEY || !ANTHROPIC_KEY) {
+  console.error("Mangler NEXT_PUBLIC_SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY / ANTHROPIC_API_KEY");
+  process.exit(1);
+}
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false } });
+const claude = new Anthropic({ apiKey: ANTHROPIC_KEY });
+
+interface ServiceRow { id: string; slug: string; name: string; description: string | null }
+interface LocationRow { id: string; slug: string; name: string }
+interface SettingsRow { phone: string; email: string }
+
+const CONTENT_TOOL = {
+  name: "submit_seo_content",
+  description: "Send unikt SEO-innhold for én kombinasjon av tjeneste + sted",
+  input_schema: {
+    type: "object" as const,
+    properties: {
+      seo_title: {
+        type: "string",
+        description: "55-60 tegn, format '<Tjeneste> i <Sted> — <selling point>'. Eks: 'Avfallscontainer i Ålesund — levert innen 48 timer'",
+      },
+      seo_description: {
+        type: "string",
+        description: "130-160 tegn, unik mellom kombinasjoner. Inkluder pris-hint + lokalt selling point.",
+      },
+      intro: {
+        type: "string",
+        description:
+          "MINST 400 ord unik tekst — IKKE template. **FORMAT-KRAV (Container Consult-bug mai 2026):** Du MÅ velge format basert på prosjektets renderer: hvis intro-feltet rendres med `<ReactMarkdown>` → bruk Markdown-syntax (## H2, ### H3, **bold**, lister). Hvis det rendres med plain `<p>` → IKKE bruk Markdown-syntax i det hele tatt, kun dobbel linjeskift mellom avsnitt. Generatoren skrev Markdown selv om page-koden rendret plain text → ## og ### viste seg som tekst på siden. Sjekk page-komponenten FØR du genererer. **Default-antakelse: hvis du ikke vet, bruk plain text med dobbel linjeskift.** Strukturér i 4-5 avsnitt: (1) sted-spesifikt behov + lokal kontekst, (2) hva tjenesten konkret innebærer, (3) hvorfor velge oss + spesifikke fortrinn for tjenesten, (4) prisindikasjon + leveringstid, (5) call to action. Nevn 2-3 lokale referansepunkter (industri, geografi, byggeprosjekter). Naturlig norsk bokmål, ikke keyword-stuffing.",
+      },
+      faq: {
+        type: "array",
+        description: "Minst 6 unike spørsmål med 60-90 ord svar hver. AEO-format — svar i 2-3 setninger som LLM-er kan sitere direkte. Variér spørsmålene per kombinasjon — ikke samme 6 på alle sider.",
+        items: {
+          type: "object",
+          properties: {
+            question: { type: "string", description: "Vanlig kundespørsmål, 5-12 ord" },
+            answer: { type: "string", description: "60-90 ord, direkte svar, ikke fluff" },
+          },
+          required: ["question", "answer"],
+        },
+        minItems: 6,
+      },
+    },
+    required: ["seo_title", "seo_description", "intro", "faq"],
+  },
+};
+
+async function generateOne(service: ServiceRow, location: LocationRow, settings: SettingsRow) {
+  const prompt = `Du skriver SEO-innhold for Container Consult AS i Ålesund. De har 50 års erfaring og dekker hele Sunnmøre og Romsdal. Telefon: ${settings.phone}.
+
+Tjeneste: ${service.name}
+Beskrivelse: ${service.description ?? "(ingen beskrivelse)"}
+Sted: ${location.name}
+
+Skriv unikt innhold for siden "${service.name} i ${location.name}".
+- Bruk lokal kontekst (nevn ${location.name} 3-5 ganger, bruk lokale referanser hvis du kjenner stedet)
+- 250+ ord i intro
+- 6 unike FAQ med 60-90 ord-svar hver
+- Naturlig norsk bokmål, ikke keyword-stuffing
+- Avslutt med subtil CTA om å ringe ${settings.phone} eller bestille online
+
+Returner via tool-call 'submit_seo_content'.`;
+
+  const response = await claude.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 4000,
+    tools: [CONTENT_TOOL],
+    tool_choice: { type: "tool", name: CONTENT_TOOL.name },
+    messages: [{ role: "user", content: prompt }],
+  });
+
+  const toolUse = response.content.find((b) => b.type === "tool_use");
+  if (!toolUse || toolUse.type !== "tool_use") {
+    throw new Error(`Ingen tool_use for ${service.slug}/${location.slug}`);
+  }
+  return toolUse.input as {
+    seo_title: string;
+    seo_description: string;
+    intro: string;
+    faq: { question: string; answer: string }[];
+  };
+}
+
+async function main() {
+  const [{ data: services }, { data: locations }, { data: settings }] = await Promise.all([
+    supabase.from("services").select("id, slug, name, description").eq("is_active", true),
+    supabase.from("locations").select("id, slug, name").eq("is_active", true),
+    supabase.from("settings").select("key, value"),
+  ]);
+
+  if (!services || !locations || !settings) {
+    console.error("Mangler services/locations/settings");
+    process.exit(1);
+  }
+
+  const settingsMap = Object.fromEntries(settings.map((s) => [s.key, s.value]));
+  const settingsObj: SettingsRow = {
+    phone: settingsMap.phone ?? "70 14 45 70",
+    email: settingsMap.email ?? "firmapost@container-consult.no",
+  };
+
+  const { data: existing } = await supabase
+    .from("service_locations")
+    .select("id, service_id, location_id, intro, faq");
+
+  const sloc = new Map(existing!.map((r) => [`${r.service_id}-${r.location_id}`, r]));
+  const tasks: { sl_id: string; service: ServiceRow; location: LocationRow }[] = [];
+
+  for (const s of services) {
+    for (const l of locations) {
+      const key = `${s.id}-${l.id}`;
+      const row = sloc.get(key);
+      if (!row) continue;
+      const hasContent = row.intro && row.intro.length > 200 && Array.isArray(row.faq) && row.faq.length >= 6;
+      if (hasContent && !FORCE) {
+        continue;
+      }
+      tasks.push({ sl_id: row.id, service: s, location: l });
+    }
+  }
+
+  console.log(`Genererer for ${tasks.length} kombinasjoner${FORCE ? " (--force)" : ""} (parallellisert: 6 om gangen)\n`);
+
+  let done = 0;
+  let failed = 0;
+
+  async function processOne(t: typeof tasks[number], idx: number) {
+    try {
+      const content = await generateOne(t.service, t.location, settingsObj);
+      const { error } = await supabase
+        .from("service_locations")
+        .update({
+          seo_title: content.seo_title,
+          seo_description: content.seo_description,
+          intro: content.intro,
+          faq: content.faq,
+        })
+        .eq("id", t.sl_id);
+      if (error) {
+        console.log(`[${idx}] ${t.service.slug}/${t.location.slug} UPDATE-feil: ${error.message}`);
+        failed++;
+        return;
+      }
+      const wordCount = content.intro.split(/\s+/).length + content.faq.reduce((s, f) => s + f.answer.split(/\s+/).length, 0);
+      done++;
+      console.log(`[${done}/${tasks.length}] ✓ ${t.service.slug}/${t.location.slug} (~${wordCount} ord)`);
+    } catch (e) {
+      console.log(`[${idx}] ✗ ${t.service.slug}/${t.location.slug}: ${(e as Error).message}`);
+      failed++;
+    }
+  }
+
+  // Kjør 6 samtidige API-kall — Claude Anthropic-konto tåler godt.
+  const BATCH = 6;
+  for (let i = 0; i < tasks.length; i += BATCH) {
+    const batch = tasks.slice(i, i + BATCH);
+    await Promise.all(batch.map((t, j) => processOne(t, i + j + 1)));
+  }
+
+  console.log(`\nFerdig: ${done}/${tasks.length} OK${failed > 0 ? `, ${failed} feilet` : ""}`);
+}
+
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});

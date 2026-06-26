@@ -1,0 +1,65 @@
+﻿# Weekly Audit — kjører audit-project.ts mot dette prosjektet hver mandag
+# og persisterer rapporten til mlit-Supabase.
+#
+# Kopier til .github/workflows/weekly-audit.yml i kunde-prosjektet og fyll
+# inn SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY som GitHub Secrets (peker mot
+# MLIT-prosjektet, ikke kunde-prosjektet).
+#
+# Krever at scripts/audit-project.ts er klonet inn i prosjektet, eller at
+# vi kaller den eksterne CLI-en (recommended: clone mlit-repo
+# midlertidig under jobben).
+
+name: Weekly Audit
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # Hver mandag kl 06:00 UTC (07/08 Norge)
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: target
+
+      - name: Clone mlit for audit-script
+        uses: actions/checkout@v4
+        with:
+          repository: helgelunde1981-creator/mlit
+          path: myrvoll-lunde-it-drifttech
+          ref: main
+          token: ${{ secrets.MLIT_BOT_TOKEN }}
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install audit-script dependencies
+        working-directory: myrvoll-lunde-it-drifttech
+        run: pnpm install --frozen-lockfile
+
+      - name: Run audit
+        working-directory: myrvoll-lunde-it-drifttech
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.MLIT_SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.MLIT_SUPABASE_SERVICE_KEY }}
+        run: |
+          pnpm tsx scripts/audit-project.ts \
+            "$GITHUB_WORKSPACE/target" \
+            --persist \
+            --triggered-by=cron
+
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-report
+          path: target/reports/audit.*

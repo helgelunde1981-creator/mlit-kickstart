@@ -1,0 +1,368 @@
+/**
+ * check-visual-quality.ts — §36 V1-V5 (AI-vision-evaluator).
+ *
+ * Tar screenshots av ≥5 sider, sender til Claude Sonnet 4.6 vision,
+ * scorer mot V1-V5 rubrikken. Snitt <7 → exit 1 (PR-blokk).
+ *
+ * Brukes i .github/workflows/quality-gate.yml.
+ *
+ * Env:
+ *   TARGET_URL (default http://localhost:3000)
+ *   ANTHROPIC_API_KEY (samme som content-generator)
+ *   DESIGN_STYLE (fra kickstart-wizard, eks. "Editorial Bento" eller "Industrial / Robust")
+ *   SUPABASE_URL / NEXT_PUBLIC_SUPABASE_URL (for å hente published pages)
+ *   SUPABASE_SERVICE_ROLE_KEY
+ *   MIN_AVG_SCORE (default 7.0)
+ */
+import { chromium, type Page } from "playwright";
+import { createClient } from "@supabase/supabase-js";
+import Anthropic from "@anthropic-ai/sdk";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+
+const URL = (process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL)?.trim();
+const KEY = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY?.trim();
+const BASE_URL = (process.env.TARGET_URL || "http://localhost:3000").trim().replace(/\/$/, "");
+const DESIGN_STYLE = (process.env.DESIGN_STYLE ?? "Editorial Bento").trim();
+const MIN_AVG = parseFloat(process.env.MIN_AVG_SCORE ?? "7.0");
+
+if (!URL || !KEY || !ANTHROPIC_KEY) {
+  console.error("Mangler SUPABASE_URL/NEXT_PUBLIC_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY eller ANTHROPIC_API_KEY");
+  process.exit(1);
+}
+
+const supabase = createClient(URL, KEY, { auth: { persistSession: false } });
+const claude = new Anthropic({ apiKey: ANTHROPIC_KEY });
+
+// Bypass Vercel deployment protection hvis TARGET_URL er en preview.
+// Set VERCEL_AUTOMATION_BYPASS_SECRET i env (fra Vercel Project Settings → Deployment Protection).
+const VERCEL_BYPASS = process.env.VERCEL_AUTOMATION_BYPASS_SECRET?.trim();
+const extraHeaders: Record<string, string> = VERCEL_BYPASS
+  ? { "x-vercel-protection-bypass": VERCEL_BYPASS, "x-vercel-set-bypass-cookie": "true" }
+  : {};
+
+const VISUAL_RUBRIC_TOOL = {
+  name: "submit_visual_score",
+  description: "Score en side mot V1, V2, V3, V5 visuell kvalitet-rubrikk",
+  input_schema: {
+    type: "object" as const,
+    properties: {
+      v1_hero_weight: {
+        type: "object",
+        properties: {
+          score: { type: "number", description: "0-10. 0-3 = ren tekst+CTA, 4-6 = bilde men underordnet, 7-10 = dominerende visuelt anker." },
+          reasoning: { type: "string" },
+        },
+        required: ["score", "reasoning"],
+      },
+      v2_layout_hierarchy: {
+        type: "object",
+        properties: {
+          score: { type: "number", description: "0-10. 0-3 = alt likestort, 4-6 = noe variasjon, 7-10 = klar visuell ledelse (bento-asymmetri, scale-variance)." },
+          reasoning: { type: "string" },
+        },
+        required: ["score", "reasoning"],
+      },
+      v3_direction_fidelity: {
+        type: "object",
+        properties: {
+          score: { type: "number", description: "0-10. Hvor godt matcher dette valgt design-direction?" },
+          reasoning: { type: "string" },
+        },
+        required: ["score", "reasoning"],
+      },
+      v5_wow_factor: {
+        type: "object",
+        properties: {
+          score: { type: "number", description: "0-10. Ville en profesjonell designer publisert dette under sitt navn?" },
+          reasoning: { type: "string" },
+        },
+        required: ["score", "reasoning"],
+      },
+      top_issues: {
+        type: "array",
+        items: { type: "string" },
+        description: "Topp 3 konkrete ting som bør fikses (handlingsoppgaver, ikke generiske kommentarer)",
+      },
+    },
+    required: ["v1_hero_weight", "v2_layout_hierarchy", "v3_direction_fidelity", "v5_wow_factor", "top_issues"],
+  },
+};
+
+const VARIATION_TOOL = {
+  name: "submit_variation_score",
+  description: "Score om N sider har distinkte layout-mønstre eller bare er samme template",
+  input_schema: {
+    type: "object" as const,
+    properties: {
+      score: { type: "number", description: "0-10. 0-3 = alle ser like ut, 4-6 = noe variasjon, 7-10 = minst 3 distinkte mønstre" },
+      reasoning: { type: "string" },
+      distinct_layouts: { type: "number", description: "Antall distinkte layout-mønstre du teller" },
+    },
+    required: ["score", "reasoning", "distinct_layouts"],
+  },
+};
+
+interface PageScore {
+  slug: string;
+  v1: number;
+  v2: number;
+  v3: number;
+  v5: number;
+  top_issues: string[];
+  reasoning: { v1: string; v2: string; v3: string; v5: string };
+}
+
+async function scorePage(page: Page, slug: string): Promise<PageScore> {
+  await page.goto(`${BASE_URL}${slug}`, { waitUntil: "networkidle", timeout: 30000 });
+  await page.waitForTimeout(1500);
+
+  // GUARD: Vercel deployment protection sender preview-URL til login-skjerm.
+  // Hvis Playwright får "Continue with Email" eller "Log in to Vercel",
+  // er TARGET_URL beskyttet. Claude vil ellers score Vercel-login-skjermen,
+  // ikke faktiske prosjektsider — falsk-negativ.
+  const html = await page.content();
+  if (/Log in to Vercel|Continue with Email|vercel\.com\/sso-api/i.test(html)) {
+    throw new Error(
+      `${slug}: Vercel deployment protection blokkerer Playwright på ${BASE_URL}. ` +
+        `Løsninger: (a) Bruk prod-URL i stedet, (b) Slå av deployment protection for preview, ` +
+        `(c) Sett VERCEL_AUTOMATION_BYPASS_SECRET i env og legg "x-vercel-protection-bypass" header.`,
+    );
+  }
+
+  const screenshot = await page.screenshot({ type: "png", fullPage: false });
+  const reportDir = join(process.cwd(), "docs", "sprint-reports", "visual-screenshots");
+  await mkdir(reportDir, { recursive: true });
+  await writeFile(join(reportDir, `${slug.replace(/\//g, "_") || "_root"}.png`), screenshot);
+
+  const result = await claude.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 2500,
+    tools: [VISUAL_RUBRIC_TOOL],
+    tool_choice: { type: "tool", name: VISUAL_RUBRIC_TOOL.name },
+    messages: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "image",
+            source: { type: "base64", media_type: "image/png", data: screenshot.toString("base64") },
+          },
+          {
+            type: "text",
+            text: `Du er en senior produkt-designer som vurderer denne forsiden mot design-direction "${DESIGN_STYLE}".
+
+Score mot V1-V5:
+
+**V1 — Hero visuell tyngde:** Har hero et dominerende visuelt anker (stort bilde, video, signature widget, illustrasjon) som tar ≥40% av viewport-arealet? Ren tekst + CTA på flat farge = 0-3. Bilde i bakgrunn under mørk overlay med sentrert tekst = 4-6. Stort bilde med karakter + integrert tekst = 7-10.
+
+**V2 — Layout-hierarki:** Er ALT like-stort (alle kort samme størrelse, uniform padding, samme farge)? Det er FAIL (0-3). Klar visuell ledelse (bento-asymmetri, ett dominerende element, scale-variance, typografisk kontrast) = 7-10.
+
+**V3 — Direction-fidelitet:** Ser dette ut som ${DESIGN_STYLE}? Vurder palette, typografi, layout-arketype, motion-cues, hvit-rom-disiplin. Hvis det ser ut som «generic Tailwind shadcn-template» uavhengig av direction → 0-4. Hvis direction-karakteren er klar i hver komponent → 7-10.
+
+**V5 — WOW-faktor:** Ville en profesjonell designer publisert dette under sitt navn på Behance/Awwwards? Vurder helhet (typografi+palette+layout+mikroanimasjoner+kontrast+hvit-rom). Vær streng — 5-6 er «teknisk OK men flat», 7+ krever karakter.
+
+**top_issues:** Topp 3 KONKRETE handlingsoppgaver (eks. «Hero har stor mørk overlay som gjør at bildet underordnes — fjern overlay og bruk gradient bottom», ikke «vurder å forbedre hero»).
+
+Returner via tool-call.`,
+          },
+        ],
+      },
+    ],
+  });
+
+  const tool = result.content.find((b) => b.type === "tool_use");
+  if (!tool || tool.type !== "tool_use") {
+    throw new Error(`Ingen vision-score for ${slug}`);
+  }
+  const input = tool.input as {
+    v1_hero_weight: { score: number; reasoning: string };
+    v2_layout_hierarchy: { score: number; reasoning: string };
+    v3_direction_fidelity: { score: number; reasoning: string };
+    v5_wow_factor: { score: number; reasoning: string };
+    top_issues: string[];
+  };
+
+  // Claude returnerer noen ganger top_issues som pipe-separert string
+  // i stedet for array. Normaliser til array uansett input-form.
+  const normalizedIssues = Array.isArray(input.top_issues)
+    ? input.top_issues
+    : typeof input.top_issues === "string"
+      ? (input.top_issues as string).split(/\s*\|\s*/).filter(Boolean)
+      : [];
+
+  return {
+    slug,
+    v1: input.v1_hero_weight.score,
+    v2: input.v2_layout_hierarchy.score,
+    v3: input.v3_direction_fidelity.score,
+    v5: input.v5_wow_factor.score,
+    top_issues: normalizedIssues,
+    reasoning: {
+      v1: input.v1_hero_weight.reasoning,
+      v2: input.v2_layout_hierarchy.reasoning,
+      v3: input.v3_direction_fidelity.reasoning,
+      v5: input.v5_wow_factor.reasoning,
+    },
+  };
+}
+
+async function scoreVariation(screenshots: Buffer[]): Promise<{ score: number; reasoning: string; distinct: number }> {
+  const result = await claude.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 1000,
+    tools: [VARIATION_TOOL],
+    tool_choice: { type: "tool", name: VARIATION_TOOL.name },
+    messages: [
+      {
+        role: "user",
+        content: [
+          ...screenshots.map((s) => ({
+            type: "image" as const,
+            source: { type: "base64" as const, media_type: "image/png" as const, data: s.toString("base64") },
+          })),
+          {
+            type: "text",
+            text: `Disse ${screenshots.length} screenshots er fra ulike sider i samme prosjekt. Score 0-10 på side-variasjon:
+
+- 0-3: alle ser ut som samme template med byttet tekst/bilder
+- 4-6: 2 distinkte layout-mønstre
+- 7-10: minst 3 distinkte layout-mønstre med ulike rytmer, hierarkier, eller seksjons-arketyper
+
+Tell antall faktiske distinkte layout-mønstre du ser. Returner via tool-call.`,
+          },
+        ],
+      },
+    ],
+  });
+
+  const tool = result.content.find((b) => b.type === "tool_use");
+  if (!tool || tool.type !== "tool_use") throw new Error("Ingen variation-score");
+  const input = tool.input as { score: number; reasoning: string; distinct_layouts: number };
+  return { score: input.score, reasoning: input.reasoning, distinct: input.distinct_layouts };
+}
+
+async function main() {
+  // Hent ≥5 ulike sider (forside + 3-4 service-sider + 1 sted×tjeneste hvis det finnes)
+  const { data: pages } = await supabase
+    .from("pages")
+    .select("slug")
+    .eq("is_published", true)
+    .order("nav_order");
+
+  if (!pages || pages.length === 0) {
+    console.error("Ingen published pages");
+    process.exit(1);
+  }
+
+  // Plukk forside + opptil 4 andre + evt. én sted×tjeneste
+  const sample = [
+    pages.find((p) => p.slug === "/")?.slug ?? pages[0].slug,
+    ...pages.filter((p) => p.slug !== "/").slice(0, 4).map((p) => p.slug),
+  ];
+
+  // Legg til 1 sted×tjeneste hvis det finnes
+  const { data: sloc } = await supabase
+    .from("service_locations")
+    .select("service_id, location_id, services(slug), locations(slug)")
+    .limit(1);
+  if (sloc && sloc.length > 0) {
+    type ServiceJoin = { service_id: string; location_id: string; services?: { slug?: string } | { slug?: string }[]; locations?: { slug?: string } | { slug?: string }[] };
+    const row = sloc[0] as unknown as ServiceJoin;
+    const svc = Array.isArray(row.services) ? row.services[0]?.slug : row.services?.slug;
+    const loc = Array.isArray(row.locations) ? row.locations[0]?.slug : row.locations?.slug;
+    if (svc && loc) sample.push(`/${svc}/${loc}`);
+  }
+
+  console.log(`Sjekker ${sample.length} sider mot direction "${DESIGN_STYLE}"\n`);
+
+  const browser = await chromium.launch();
+  const context = await browser.newContext({
+    viewport: { width: 1280, height: 800 },
+    ...(Object.keys(extraHeaders).length > 0 ? { extraHTTPHeaders: extraHeaders } : {}),
+  });
+  const results: PageScore[] = [];
+  const screenshotsForVariation: Buffer[] = [];
+
+  for (const slug of sample) {
+    const page = await context.newPage();
+    console.log(`→ ${slug}`);
+    try {
+      const r = await scorePage(page, slug);
+      results.push(r);
+      console.log(`   V1:${r.v1} V2:${r.v2} V3:${r.v3} V5:${r.v5}`);
+      if (r.top_issues.length > 0) {
+        console.log(`   Topp issues: ${r.top_issues.slice(0, 2).join(" | ")}`);
+      }
+      // Bevar screenshot for variation-score
+      const shot = await page.screenshot({ type: "png", fullPage: false });
+      screenshotsForVariation.push(shot);
+    } catch (e) {
+      console.log(`   ✗ ${(e as Error).message}`);
+    }
+    await page.close();
+  }
+
+  console.log(`\n→ V4 (side-variasjon, ${screenshotsForVariation.length} screenshots)`);
+  let v4 = { score: 0, reasoning: "ikke kjørt", distinct: 0 };
+  if (screenshotsForVariation.length >= 3) {
+    v4 = await scoreVariation(screenshotsForVariation);
+    console.log(`   V4: ${v4.score} (${v4.distinct} distinkte layouts)`);
+  }
+  await browser.close();
+
+  const perPageAvg = results.map((r) => (r.v1 + r.v2 + r.v3 + r.v5) / 4);
+  const visualSnitt = perPageAvg.reduce((s, x) => s + x, 0) / perPageAvg.length;
+  const totalSnitt = (visualSnitt + v4.score) / 2;
+
+  const report = [
+    `# Visual Quality Report (§36)`,
+    `Generert: ${new Date().toISOString()}`,
+    `Direction: ${DESIGN_STYLE}`,
+    `Krav: snitt ≥${MIN_AVG.toFixed(1)}/10`,
+    ``,
+    `**Per-side snitt:** ${visualSnitt.toFixed(2)}/10`,
+    `**V4 (variasjon):** ${v4.score}/10 (${v4.distinct} distinkte layouts)`,
+    `**Total snitt:** ${totalSnitt.toFixed(2)}/10`,
+    ``,
+    `## Per-side`,
+    ``,
+    ...results.map((r) => `### ${r.slug} — snitt ${((r.v1 + r.v2 + r.v3 + r.v5) / 4).toFixed(1)}/10
+
+- **V1 hero:** ${r.v1}/10 — ${r.reasoning.v1}
+- **V2 hierarki:** ${r.v2}/10 — ${r.reasoning.v2}
+- **V3 direction:** ${r.v3}/10 — ${r.reasoning.v3}
+- **V5 wow:** ${r.v5}/10 — ${r.reasoning.v5}
+
+**Topp issues:**
+${r.top_issues.map((i) => `- ${i}`).join("\n")}
+`),
+    ``,
+    `## V4 — Side-variasjon`,
+    ``,
+    v4.reasoning,
+  ].join("\n");
+
+  const reportDir = join(process.cwd(), "docs", "sprint-reports");
+  await mkdir(reportDir, { recursive: true });
+  const reportPath = join(reportDir, `visual-quality-${Date.now()}.md`);
+  await writeFile(reportPath, report);
+
+  console.log(`\n📊 Rapport: ${reportPath}`);
+  console.log(`   Per-side snitt: ${visualSnitt.toFixed(2)}/10`);
+  console.log(`   V4 variasjon: ${v4.score}/10`);
+  console.log(`   TOTAL: ${totalSnitt.toFixed(2)}/10`);
+
+  if (totalSnitt < MIN_AVG) {
+    console.error(`\n❌ Visual quality under terskel (${totalSnitt.toFixed(2)} < ${MIN_AVG}) — sprint ikke ferdig`);
+    process.exit(1);
+  }
+
+  console.log(`\n✅ Visual quality OK (≥${MIN_AVG})`);
+}
+
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});

@@ -1,0 +1,97 @@
+'use client'
+
+import { motion } from 'framer-motion'
+import { Truck } from 'lucide-react'
+import type { ReactNode } from 'react'
+
+/**
+ * Dark Luxury Motion — Card example
+ *
+ * Glass-card med faktisk dybde:
+ * - Backdrop-blur for å skape lag
+ * - Subtil border som forsterker overflate-kant
+ * - Hover: lift + shadow-expand + border lyser opp
+ * - Active: snap back ned (taktilt)
+ */
+
+type CardProps = {
+  icon?: ReactNode
+  title: string
+  description: string
+  href?: string
+  variant?: 'default' | 'featured'
+}
+
+export function Card({ icon, title, description, href, variant = 'default' }: CardProps) {
+  const isFeatured = variant === 'featured'
+
+  const Wrapper = href ? motion.a : motion.div
+
+  return (
+    <Wrapper
+      href={href}
+      initial={{ opacity: 0, y: 16 }}
+      whileInView={{ opacity: 1, y: 0 }}
+      viewport={{ once: true, margin: '-100px' }}
+      transition={{ duration: 0.6, ease: [0.16, 1, 0.3, 1] }}
+      className={`
+        group relative block overflow-hidden rounded-xl
+        ${isFeatured
+          ? 'border border-accent-primary/30 bg-gradient-to-br from-surface-glass to-surface-1 shadow-glow'
+          : 'border border-border-subtle bg-surface-glass'}
+        p-6 backdrop-blur-[var(--blur-glass)]
+        transition-all duration-normal ease-out-expo
+        hover:-translate-y-1 hover:border-border-strong hover:shadow-card
+        active:translate-y-0 active:duration-fast
+        focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-primary focus-visible:ring-offset-2 focus-visible:ring-offset-bg
+      `}
+    >
+      {/* Featured-glow i hjørne */}
+      {isFeatured && (
+        <div
+          aria-hidden
+          className="absolute -right-12 -top-12 h-32 w-32 rounded-full opacity-40 blur-3xl transition-opacity duration-slow group-hover:opacity-60"
+          style={{ background: 'var(--color-accent-primary)' }}
+        />
+      )}
+
+      {icon && (
+        <div className="
+          mb-5 inline-flex h-12 w-12 items-center justify-center
+          rounded-lg border border-border-subtle bg-surface-2
+          text-accent-primary
+          transition-all duration-normal ease-out-expo
+          group-hover:border-accent-primary group-hover:bg-accent-primary/10
+        ">
+          {icon}
+        </div>
+      )}
+
+      <h3 className="font-display text-lg font-medium tracking-tight text-text-primary">
+        {title}
+      </h3>
+
+      <p className="mt-2 text-sm leading-relaxed text-text-secondary">
+        {description}
+      </p>
+
+      {href && (
+        <div className="mt-5 inline-flex items-center gap-1 font-mono text-2xs uppercase tracking-mono text-text-mono transition-colors duration-fast group-hover:text-accent-primary">
+          <span>Les mer</span>
+          <span aria-hidden className="transition-transform duration-fast group-hover:translate-x-0.5">
+            →
+          </span>
+        </div>
+      )}
+    </Wrapper>
+  )
+}
+
+/* Bruk:
+<Card
+  icon={<Truck size={24} strokeWidth={1.5} />}
+  title="Varebil"
+  description="Henter pakker fra 0–999 kg, levert samme dag innen Sone 1–4."
+  href="/biler/varebil"
+/>
+*/

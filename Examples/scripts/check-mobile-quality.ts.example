@@ -1,0 +1,397 @@
+/**
+ * check-mobile-quality.ts — §39 mobil-kvalitet (M1-M6).
+ *
+ * Discover'er alle published pages, åpner hver i Playwright på 3 mobile
+ * viewports (iPhone SE 375×667, iPhone 13 390×844, Galaxy S20 360×800),
+ * scroller til hver <section>/CMS-modul og tar screenshot, sender til
+ * Claude Sonnet 4.6 vision-evaluator. Scorer M1-M6. Snitt <9.0 ELLER
+ * noen kritisk M1/M4-feil → exit 1 (PR-blokk).
+ *
+ * Brukes i .github/workflows/quality-gate.yml.
+ *
+ * AI MÅ iterere — fikse feil → kjør på nytt → fortsette til alle scorer 9+.
+ *
+ * Env:
+ *   PLAYWRIGHT_BASE_URL (default http://localhost:3000)
+ *   ANTHROPIC_API_KEY
+ *   SUPABASE_URL / NEXT_PUBLIC_SUPABASE_URL
+ *   SUPABASE_SERVICE_ROLE_KEY
+ *   VERCEL_AUTOMATION_BYPASS_SECRET (valgfri — for preview-URLer med protection)
+ *   MIN_AVG_SCORE (default 9.0)
+ *   SPRINT_N (default "current" — brukes i rapport-navn)
+ */
+import { chromium, devices, type Page, type BrowserContext } from "playwright";
+import { createClient } from "@supabase/supabase-js";
+import Anthropic from "@anthropic-ai/sdk";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+
+const URL = (process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL)?.trim();
+const KEY = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY?.trim();
+const BASE_URL = (process.env.PLAYWRIGHT_BASE_URL || "http://localhost:3000").trim().replace(/\/$/, "");
+const MIN_AVG = parseFloat(process.env.MIN_AVG_SCORE ?? "9.0");
+const SPRINT_N = (process.env.SPRINT_N ?? "current").trim();
+
+if (!URL || !KEY || !ANTHROPIC_KEY) {
+  console.error("Mangler SUPABASE_URL/NEXT_PUBLIC_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY eller ANTHROPIC_API_KEY");
+  process.exit(1);
+}
+
+const supabase = createClient(URL, KEY, { auth: { persistSession: false } });
+const claude = new Anthropic({ apiKey: ANTHROPIC_KEY });
+
+// Vercel deployment protection bypass
+const VERCEL_BYPASS = process.env.VERCEL_AUTOMATION_BYPASS_SECRET?.trim();
+const extraHeaders: Record<string, string> = VERCEL_BYPASS
+  ? { "x-vercel-protection-bypass": VERCEL_BYPASS, "x-vercel-set-bypass-cookie": "true" }
+  : {};
+
+const VIEWPORTS = [
+  { name: "iPhone SE", width: 375, height: 667, device: "iPhone SE" as const },
+  { name: "iPhone 13", width: 390, height: 844, device: "iPhone 13" as const },
+  { name: "Galaxy S20", width: 360, height: 800, device: "Galaxy S9+" as const },
+] satisfies Array<{ name: string; width: number; height: number; device: keyof typeof devices }>;
+
+const MOBILE_RUBRIC_TOOL = {
+  name: "submit_mobile_score",
+  description: "Score en modul/seksjon mot M1-M6 mobil-kvalitet-rubrikk",
+  input_schema: {
+    type: "object" as const,
+    properties: {
+      m1_layout: {
+        type: "object",
+        properties: {
+          score: { type: "number", description: "0-10. <8 = kritisk. Horizontal scroll, overflow utenfor viewport, content kuttet av." },
+          reasoning: { type: "string" },
+        },
+        required: ["score", "reasoning"],
+      },
+      m2_tap_targets: {
+        type: "object",
+        properties: {
+          score: { type: "number", description: "0-10. Alle knapper/lenker ≥44×44 px (iOS guideline)?" },
+          reasoning: { type: "string" },
+        },
+        required: ["score", "reasoning"],
+      },
+      m3_readability: {
+        type: "object",
+        properties: {
+          score: { type: "number", description: "0-10. Brødtekst ≥14px? Headinger ikke for store? Linjebredde rimelig?" },
+          reasoning: { type: "string" },
+        },
+        required: ["score", "reasoning"],
+      },
+      m4_nav: {
+        type: "object",
+        properties: {
+          score: { type: "number", description: "0-10. <8 = kritisk. Mobil-meny tilgjengelig? Hamburger synlig? Ingen desktop-dropdown synlig?" },
+          reasoning: { type: "string" },
+        },
+        required: ["score", "reasoning"],
+      },
+      m5_hero_cta: {
+        type: "object",
+        properties: {
+          score: { type: "number", description: "0-10. Primær CTA synlig i første viewport? Hero ikke 100 % høyde?" },
+          reasoning: { type: "string" },
+        },
+        required: ["score", "reasoning"],
+      },
+      m6_forms: {
+        type: "object",
+        properties: {
+          score: { type: "number", description: "0-10. Input ≥16px (hindrer iOS zoom)? Skjema brukbart med touch-keyboard?" },
+          reasoning: { type: "string" },
+        },
+        required: ["score", "reasoning"],
+      },
+      critical_issues: {
+        type: "array",
+        items: { type: "string" },
+        description: "Kritiske feil som MÅ fikses (M1 overflow, M4 nav-mangel). Tom hvis ingen.",
+      },
+      fix_actions: {
+        type: "array",
+        items: { type: "string" },
+        description: "Topp 3 konkrete fix-handlinger med fil/selektor-hint hvis mulig.",
+      },
+    },
+    required: ["m1_layout", "m2_tap_targets", "m3_readability", "m4_nav", "m5_hero_cta", "m6_forms", "critical_issues", "fix_actions"],
+  },
+};
+
+interface ModuleScore {
+  slug: string;
+  viewport: string;
+  module: string;
+  m1: number;
+  m2: number;
+  m3: number;
+  m4: number;
+  m5: number;
+  m6: number;
+  critical: string[];
+  fixes: string[];
+  reasoning: Record<string, string>;
+}
+
+async function scrollAndCaptureModules(page: Page): Promise<Array<{ name: string; buffer: Buffer }>> {
+  // Vent på lazy-loaded content
+  await page.waitForLoadState("networkidle", { timeout: 30000 });
+  await page.waitForTimeout(1000);
+
+  // Finn alle seksjoner — prioriter <section> + data-cms-module + role-attributter
+  const moduleSelectors = await page.evaluate(() => {
+    const candidates = Array.from(
+      document.querySelectorAll<HTMLElement>(
+        'section, [data-cms-module], [data-module], [role="banner"], main > div, footer',
+      ),
+    );
+    return candidates
+      .filter((el) => el.offsetHeight > 100 && el.offsetWidth > 100)
+      .map((el, i) => {
+        const id = el.id || el.dataset.cmsModule || el.dataset.module || `module-${i + 1}`;
+        const rect = el.getBoundingClientRect();
+        return { id, top: rect.top + window.scrollY, height: rect.height };
+      });
+  });
+
+  const captures: Array<{ name: string; buffer: Buffer }> = [];
+  for (const mod of moduleSelectors) {
+    await page.evaluate((y) => window.scrollTo({ top: y, behavior: "instant" as ScrollBehavior }), mod.top);
+    await page.waitForTimeout(400);
+    const buffer = await page.screenshot({ type: "png", fullPage: false });
+    captures.push({ name: mod.id, buffer });
+  }
+
+  return captures.slice(0, 8); // cap på 8 moduler per side per viewport for å holde token-bruk rimelig
+}
+
+async function scoreModule(
+  buffer: Buffer,
+  slug: string,
+  viewportName: string,
+  moduleName: string,
+): Promise<ModuleScore> {
+  const result = await claude.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 2500,
+    tools: [MOBILE_RUBRIC_TOOL],
+    tool_choice: { type: "tool", name: MOBILE_RUBRIC_TOOL.name },
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "image", source: { type: "base64", media_type: "image/png", data: buffer.toString("base64") } },
+          {
+            type: "text",
+            text: `Dette er en screenshot fra modul "${moduleName}" på siden "${slug}" rendert i ${viewportName} viewport.
+
+Score mobil-kvalitet på M1-M6:
+
+**M1 Layout (kritisk < 8):** Er det horizontal scroll? Content kuttet av høyre/venstre? Overflow utenfor viewport? Hardkodet width større enn skjerm?
+
+**M2 Tap-targets:** Er knapper/ikoner/lenker minst 44×44 px? Sosial-ikoner, hamburger, små piler er hyppige syndere.
+
+**M3 Lesbarhet:** Brødtekst ≥14 px? Headinger ikke desktop-store (h1 = 64 px på mobil er fail)? Linjebredde rimelig (ikke alt på én linje, ikke ord-knekk)?
+
+**M4 Navigasjon (kritisk < 8):** Hvis dette er header-modulen: synlig hamburger? Ingen desktop-nav-lenker synlig? Hvis dette er en annen modul: ignorer M4 (sett 10).
+
+**M5 Hero + CTA:** Hvis dette er hero: er primær CTA synlig over fold? Hero ikke 100 % høyde (etterlater plass for content under)? Hvis ikke hero: ignorer M5 (sett 10).
+
+**M6 Skjemaer:** Hvis dette er et skjema: input-felt ser 16 px+ ut? Knapp synlig uten å skjules av touch-keyboard? Hvis ikke skjema: ignorer M6 (sett 10).
+
+**critical_issues:** Kun det som er M1<8 eller M4<8 (kritiske kategorier).
+**fix_actions:** Topp 3 konkrete fixer ("legg til overflow-x:hidden på <main>", ikke "vurder layout").
+
+Returner via tool-call.`,
+          },
+        ],
+      },
+    ],
+  });
+
+  const tool = result.content.find((b) => b.type === "tool_use");
+  if (!tool || tool.type !== "tool_use") throw new Error(`Ingen score for ${slug}/${moduleName}/${viewportName}`);
+  const input = tool.input as {
+    m1_layout: { score: number; reasoning: string };
+    m2_tap_targets: { score: number; reasoning: string };
+    m3_readability: { score: number; reasoning: string };
+    m4_nav: { score: number; reasoning: string };
+    m5_hero_cta: { score: number; reasoning: string };
+    m6_forms: { score: number; reasoning: string };
+    critical_issues: string[] | string;
+    fix_actions: string[] | string;
+  };
+
+  const norm = (v: string[] | string | undefined): string[] =>
+    Array.isArray(v) ? v : typeof v === "string" ? v.split(/\s*\|\s*/).filter(Boolean) : [];
+
+  return {
+    slug,
+    viewport: viewportName,
+    module: moduleName,
+    m1: input.m1_layout.score,
+    m2: input.m2_tap_targets.score,
+    m3: input.m3_readability.score,
+    m4: input.m4_nav.score,
+    m5: input.m5_hero_cta.score,
+    m6: input.m6_forms.score,
+    critical: norm(input.critical_issues),
+    fixes: norm(input.fix_actions),
+    reasoning: {
+      m1: input.m1_layout.reasoning,
+      m2: input.m2_tap_targets.reasoning,
+      m3: input.m3_readability.reasoning,
+      m4: input.m4_nav.reasoning,
+      m5: input.m5_hero_cta.reasoning,
+      m6: input.m6_forms.reasoning,
+    },
+  };
+}
+
+async function checkPage(context: BrowserContext, slug: string, viewportName: string): Promise<ModuleScore[]> {
+  const page = await context.newPage();
+  try {
+    await page.goto(`${BASE_URL}${slug}`, { waitUntil: "domcontentloaded", timeout: 30000 });
+
+    // Vercel-protection guard
+    const html = await page.content();
+    if (/Log in to Vercel|Continue with Email|vercel\.com\/sso-api/i.test(html)) {
+      throw new Error(
+        `${slug}: Vercel deployment protection blokkerer Playwright på ${BASE_URL}. ` +
+          `Sett VERCEL_AUTOMATION_BYPASS_SECRET i env eller bruk prod-URL.`,
+      );
+    }
+
+    const captures = await scrollAndCaptureModules(page);
+    const screenshotsDir = join(process.cwd(), "docs", "sprint-reports", "mobile-screenshots", viewportName.replace(/\s+/g, "_"));
+    await mkdir(screenshotsDir, { recursive: true });
+
+    const scores: ModuleScore[] = [];
+    for (const cap of captures) {
+      const fileName = `${slug.replace(/\//g, "_") || "_root"}__${cap.name}.png`;
+      await writeFile(join(screenshotsDir, fileName), cap.buffer);
+      const score = await scoreModule(cap.buffer, slug, viewportName, cap.name);
+      scores.push(score);
+    }
+    return scores;
+  } finally {
+    await page.close();
+  }
+}
+
+async function main(): Promise<void> {
+  const { data: pages } = await supabase
+    .from("pages")
+    .select("slug")
+    .eq("is_published", true)
+    .order("nav_order");
+
+  if (!pages || pages.length === 0) {
+    console.error("Ingen published pages");
+    process.exit(1);
+  }
+
+  console.log(`📱 Mobile quality check — ${pages.length} sider × ${VIEWPORTS.length} viewports\n`);
+
+  const browser = await chromium.launch();
+  const allScores: ModuleScore[] = [];
+
+  for (const vp of VIEWPORTS) {
+    console.log(`\n=== ${vp.name} (${vp.width}×${vp.height}) ===`);
+    const context = await browser.newContext({
+      ...devices[vp.device],
+      viewport: { width: vp.width, height: vp.height },
+      ...(Object.keys(extraHeaders).length > 0 ? { extraHTTPHeaders: extraHeaders } : {}),
+    });
+
+    for (const p of pages) {
+      console.log(`  → ${p.slug}`);
+      try {
+        const scores = await checkPage(context, p.slug, vp.name);
+        allScores.push(...scores);
+        for (const s of scores) {
+          const avg = (s.m1 + s.m2 + s.m3 + s.m4 + s.m5 + s.m6) / 6;
+          const flag = s.critical.length > 0 ? " ⚠ CRITICAL" : avg < MIN_AVG ? " ⚠" : " ✓";
+          console.log(`     [${s.module}] snitt ${avg.toFixed(1)}${flag}`);
+        }
+      } catch (e) {
+        console.log(`     ✗ ${(e as Error).message}`);
+      }
+    }
+
+    await context.close();
+  }
+
+  await browser.close();
+
+  // Aggregate
+  const moduleAvgs = allScores.map((s) => (s.m1 + s.m2 + s.m3 + s.m4 + s.m5 + s.m6) / 6);
+  const totalAvg = moduleAvgs.reduce((s, x) => s + x, 0) / Math.max(moduleAvgs.length, 1);
+  const criticalCount = allScores.filter((s) => s.critical.length > 0).length;
+
+  // Per-side aggregate
+  const perPage = new Map<string, ModuleScore[]>();
+  for (const s of allScores) {
+    const key = `${s.slug}|${s.viewport}`;
+    if (!perPage.has(key)) perPage.set(key, []);
+    perPage.get(key)!.push(s);
+  }
+
+  const report: string[] = [
+    `# Sprint ${SPRINT_N} — Mobile Quality Report (§39)`,
+    ``,
+    `Generert: ${new Date().toISOString()}`,
+    `Base URL: ${BASE_URL}`,
+    `Viewports: ${VIEWPORTS.map((v) => `${v.name} (${v.width}×${v.height})`).join(", ")}`,
+    `Krav: snitt ≥${MIN_AVG.toFixed(1)}/10 + 0 kritiske M1/M4-feil`,
+    ``,
+    `## Sammendrag`,
+    ``,
+    `- Sider testet: ${pages.length}`,
+    `- Moduler testet: ${allScores.length}`,
+    `- Snitt M1-M6: **${totalAvg.toFixed(2)}/10**`,
+    `- Kritiske feil: **${criticalCount}** ${criticalCount === 0 ? "✅" : "❌"}`,
+    ``,
+    `## Per side × viewport`,
+    ``,
+  ];
+
+  for (const [key, scores] of perPage.entries()) {
+    const [slug, vp] = key.split("|");
+    const avg = scores.reduce((s, x) => s + (x.m1 + x.m2 + x.m3 + x.m4 + x.m5 + x.m6) / 6, 0) / scores.length;
+    report.push(`### ${slug} — ${vp}`);
+    report.push(`Snitt: **${avg.toFixed(2)}/10**`);
+    report.push(``);
+    for (const s of scores) {
+      const a = (s.m1 + s.m2 + s.m3 + s.m4 + s.m5 + s.m6) / 6;
+      report.push(`- **${s.module}** (${a.toFixed(1)}): M1=${s.m1} M2=${s.m2} M3=${s.m3} M4=${s.m4} M5=${s.m5} M6=${s.m6}`);
+      if (s.critical.length > 0) report.push(`  - 🚨 Critical: ${s.critical.join("; ")}`);
+      if (s.fixes.length > 0) report.push(`  - Fix: ${s.fixes.join("; ")}`);
+    }
+    report.push(``);
+  }
+
+  const reportDir = join(process.cwd(), "docs", "sprint-reports");
+  await mkdir(reportDir, { recursive: true });
+  const reportPath = join(reportDir, `sprint-${SPRINT_N}-mobile.md`);
+  await writeFile(reportPath, report.join("\n"));
+  console.log(`\n📄 Rapport: ${reportPath}`);
+  console.log(`📸 Screenshots: docs/sprint-reports/mobile-screenshots/`);
+
+  const fail = criticalCount > 0 || totalAvg < MIN_AVG;
+  if (fail) {
+    console.error(`\n❌ FAIL: snitt ${totalAvg.toFixed(2)} (krav ${MIN_AVG.toFixed(1)}), ${criticalCount} kritiske`);
+    console.error(`AI MÅ fikse feil og kjøre på nytt — fortsett til alle moduler er 9+ uten kritiske.`);
+    process.exit(1);
+  }
+  console.log(`\n✅ PASS: snitt ${totalAvg.toFixed(2)}/10, 0 kritiske`);
+}
+
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});

@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# check-anti-template.sh — håndhever §34 «Signature moment-trace» + anti-template.
+#
+# Failer hvis prosjektet bryter PROJECT.md §6 anti-template-sjekkliste:
+#  - Manglende data-signature-moment på forsiden
+#  - 6+ identiske bento-kort uten varianter (size/color/content-hierarki)
+#  - Sentrert hero uten visuelt anker (bilde/illustrasjon/widget)
+#  - Default Tailwind-utseende uten brand-token-bruk
+#
+# Brukes i .github/workflows/quality-gate.yml som PR-blokk.
+#
+# Kjør lokalt: bash scripts/check-anti-template.sh
+
+set -e
+EXIT=0
+
+red()    { printf '\033[31m%s\033[0m\n' "$1"; }
+green()  { printf '\033[32m%s\033[0m\n' "$1"; }
+yellow() { printf '\033[33m%s\033[0m\n' "$1"; }
+
+echo "🔍 Sjekker mot §34 signature moment + anti-template…"
+echo
+
+# ──────────────────────────────────────────────────────────────
+# 1. data-signature-moment attribute eksisterer i kodebasen
+# ──────────────────────────────────────────────────────────────
+echo "1) data-signature-moment attribute finnes"
+HITS=$(grep -rnE 'data-signature-moment\s*=' src/ \
+  --include='*.tsx' --include='*.ts' \
+  --exclude-dir=node_modules --exclude-dir=.next \
+  2>/dev/null || true)
+if [ -z "$HITS" ]; then
+  red "❌ Ingen data-signature-moment-tagg funnet i koden"
+  yellow "   → Signature moment-komponenten MÅ tagges på rot-element."
+  yellow "   → Se 06-SECTION_DETAILS/signature-moment.md"
+  EXIT=1
+else
+  green "✅ Signature moment-komponent funnet:"
+  echo "$HITS" | head -3
+fi
+echo
+
+# ──────────────────────────────────────────────────────────────
+# 2. Signature moment importeres i app/page.tsx (forsiden)
+# ──────────────────────────────────────────────────────────────
+echo "2) Signature moment importert på forsiden"
+HOMEPAGE_FILES=$(find src/app -maxdepth 4 -name 'page.tsx' -path '*/\(public\)/page.tsx' -o \
+  -path '*/(public)/page.tsx' -o \
+  \( -path 'src/app/page.tsx' -not -path '*node_modules*' \) 2>/dev/null | head -3)
+
+if [ -z "$HOMEPAGE_FILES" ]; then
+  yellow "⚠️  Fant ikke forside-page.tsx — hopper sjekk 2"
+else
+  FOUND=0
+  for f in $HOMEPAGE_FILES; do
+    # Sjekk om filen importerer en komponent som har data-signature-moment
+    COMP_NAMES=$(grep -oE 'data-signature-moment\s*=\s*"[a-z0-9-]+"' src/ -r \
+      --include='*.tsx' 2>/dev/null \
+      | grep -oE '"[a-z0-9-]+"$' | tr -d '"' | sort -u)
+    for name in $COMP_NAMES; do
+      # Heuristikk: er komponenten brukt i forsiden? Sjekk komponent-fil-import
+      COMP_FILES=$(grep -lr "data-signature-moment=\"$name\"" src/ --include='*.tsx' \
+        --exclude-dir=node_modules 2>/dev/null | head -1)
+      for cf in $COMP_FILES; do
+        # Ekstraherer komponent-navn fra eksport
+        EXPORT_NAME=$(grep -oE 'export (function|const) [A-Z][A-Za-z0-9]+' "$cf" 2>/dev/null \
+          | head -1 | awk '{print $NF}')
+        if [ -n "$EXPORT_NAME" ] && grep -q "$EXPORT_NAME" "$f" 2>/dev/null; then
+          FOUND=1
+          break 2
+        fi
+      done
+    done
+  done
+  if [ $FOUND -eq 1 ]; then
+    green "✅ Signature moment-komponent importert i forsiden"
+  else
+    red "❌ Signature moment IKKE importert i forsiden ($HOMEPAGE_FILES)"
+    yellow "   → §5.2 krever primær plassering på forsiden over fold."
+    yellow "   → Container Consult-feilen: bygd komponent, gjemt på /bestill."
+    EXIT=1
+  fi
+fi
+echo
+
+# ──────────────────────────────────────────────────────────────
+# 3. Bento-grid med 6+ identiske kort uten varianter
+# ──────────────────────────────────────────────────────────────
+echo "3) Bento-grid har visuelt hierarki (ikke 6+ identiske kort)"
+# Heuristikk: grep grid-classes med høyt antall like child-komponenter
+# Dette er en grov sjekk — overspirer på falske positives, men det er bedre enn å miste reelle problemer.
+SUSPICIOUS=$(grep -rnE 'grid-cols-(3|4|6)' src/components/ src/app/ \
+  --include='*.tsx' --exclude-dir=node_modules 2>/dev/null \
+  | grep -v 'sm:\|md:\|lg:\|xl:' | head -5)
+
+if [ -n "$SUSPICIOUS" ]; then
+  yellow "⚠️  Grid-cols funnet (manuell review trengs):"
+  echo "$SUSPICIOUS"
+  yellow "   Sjekk at minst ett kort har annerledes størrelse/farge/innhold."
+  yellow "   Bento-pattern: col-span-2, row-span-2 på et nøkkel-kort."
+fi
+echo
+
+# ──────────────────────────────────────────────────────────────
+# 4. Bruk av brand-tokens (ikke default Tailwind-farger)
+# ──────────────────────────────────────────────────────────────
+echo "4) Brand-tokens brukes (ikke default Tailwind-farger)"
+DEFAULT_COLORS=$(grep -rnE 'bg-(slate|gray|zinc|neutral|stone)-[0-9]+|text-(slate|gray|zinc|neutral|stone)-[0-9]+' \
+  src/components/ src/app/ \
+  --include='*.tsx' --exclude-dir=node_modules 2>/dev/null \
+  | grep -v 'border-\|hover:\|focus:\|disabled:' | wc -l | tr -d ' ')
+
+if [ "$DEFAULT_COLORS" -gt 30 ]; then
+  red "❌ ${DEFAULT_COLORS} treff på default Tailwind-grays — bruker du brand-tokens?"
+  yellow "   → Bruk bg-bg-primary, text-text-primary, etc. (fra tokens.css)"
+  yellow "   → Default-grays signaliserer ufullstendig brand-tilpasning."
+  EXIT=1
+else
+  green "✅ Få default-grays ($DEFAULT_COLORS) — brand-tokens dominerer"
+fi
+echo
+
+# ──────────────────────────────────────────────────────────────
+# 5. Anti-pattern: sentrert hero uten visuelt anker
+# ──────────────────────────────────────────────────────────────
+echo "5) Hero har visuelt anker (bilde/widget/illustrasjon)"
+HERO_FILES=$(grep -rlE 'data-hero|class.*hero|<Hero' src/components/ src/app/ \
+  --include='*.tsx' --exclude-dir=node_modules 2>/dev/null | head -3)
+
+if [ -z "$HERO_FILES" ]; then
+  yellow "⚠️  Fant ingen Hero-komponent (hopper sjekk 5)"
+else
+  HAS_ANCHOR=0
+  for f in $HERO_FILES; do
+    if grep -qE '<(Image|img|video|canvas|svg|BookingCalculator)' "$f" 2>/dev/null; then
+      HAS_ANCHOR=1
+      break
+    fi
+  done
+  if [ $HAS_ANCHOR -eq 1 ]; then
+    green "✅ Hero har bilde/video/widget — ikke ren tekst"
+  else
+    red "❌ Hero ser ut som ren tekst + CTA — anti-template-brudd (§6)"
+    yellow "   → Hero MÅ ha visuelt anker: bilde, video, illustrasjon eller signature widget."
+    EXIT=1
+  fi
+fi
+echo
+
+echo
+# ──────────────────────────────────────────────────────────────
+# 6. Hero-konsistens på tvers av rute-typer (§36 + V3)
+# ──────────────────────────────────────────────────────────────
+echo "6) Hero-konsistens på tvers av rute-typer"
+# Tell hvor mange unike hero-implementasjoner som finnes
+# (forskjellige <HeroX>-komponenter / inline <section className="...hero...">-mønstre)
+HERO_COMPONENTS=$(grep -rhE '<Hero[A-Z]\w*|<section[^>]*"[^"]*hero[^"]*"' src/ --include='*.tsx' \
+  --exclude-dir=node_modules 2>/dev/null \
+  | grep -oE '<(Hero[A-Z]\w*|section)\b' | sort -u | wc -l | tr -d ' ')
+
+if [ "$HERO_COMPONENTS" -gt 3 ]; then
+  red "❌ ${HERO_COMPONENTS} ulike hero-implementasjoner — inkonsistens på tvers av rute-typer"
+  yellow "   → Container Consult-feilen: /, /tjenester brukte HeroSection."
+  yellow "     /kontakt, /om-oss hadde egne hero med flat farge."
+  yellow "     Sted×tjeneste hadde ingen hero. V1-V3 dropper ujevnt."
+  yellow "   → Lag ÉN <Hero>/<PageHero>-komponent med direction-tokens + bruk på ALLE ruter."
+  EXIT=1
+else
+  green "✅ ${HERO_COMPONENTS} hero-implementasjon(er) — konsistent"
+fi
+echo
+
+# ──────────────────────────────────────────────────────────────
+# 7. Motion-bibliotek importert i hero (kobler L1-L4 til V5)
+# ──────────────────────────────────────────────────────────────
+echo "7) Motion-bibliotek importert i hero-komponenten(e)"
+# V5 WOW-faktor på Container Consult var <5 selv etter hero-bilde-fix
+# fordi sidene mangler bevegelse. Motion-bibliotek må være importert
+# i selve hero-komponenten — ikke bare et tilfeldig sted i kodebasen.
+HERO_FILES=$(grep -rlE '<Hero[A-Z]\w*|export function Hero|export const Hero' src/components/ \
+  --include='*.tsx' --exclude-dir=node_modules 2>/dev/null | head -5)
+
+if [ -z "$HERO_FILES" ]; then
+  yellow "⚠️  Fant ingen Hero-komponent (hopper sjekk 7)"
+else
+  HAS_MOTION_IN_HERO=0
+  for f in $HERO_FILES; do
+    if grep -qE "from ['\"]motion/react|from ['\"]framer-motion|from ['\"]gsap" "$f" 2>/dev/null; then
+      HAS_MOTION_IN_HERO=1
+      break
+    fi
+  done
+  if [ $HAS_MOTION_IN_HERO -eq 1 ]; then
+    green "✅ Motion-bibliotek importert i hero-komponent"
+  else
+    red "❌ Hero-komponenten(e) har INGEN motion-import"
+    yellow "   → V5 (WOW) vil score <5 fordi siden 'føles flat'."
+    yellow "   → Importer motion/react ELLER gsap i hero-komponenten."
+    yellow "   → Minimum: whileInView eller initial/animate på hero-tekst."
+    EXIT=1
+  fi
+fi
+echo
+
+if [ "$EXIT" -ne 0 ]; then
+  red "🚫 §34/§36 signature moment + anti-template brutt — se output over"
+  red "   Full anti-pattern-guide: docs/standards/06-SECTION_DETAILS/signature-moment.md"
+  red "   + visual-quality.md for V1-V5"
+  exit 1
+fi
+
+green "✅ Signature moment + anti-template + hero-konsistens oppfylt"

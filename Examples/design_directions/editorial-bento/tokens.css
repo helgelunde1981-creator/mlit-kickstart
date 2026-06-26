@@ -1,0 +1,79 @@
+/**
+ * Editorial Bento — design-tokens
+ * Karakteristikker: asymmetrisk grid, store typografiske kontraster,
+ * redaksjonell rytme, hvit-rom som strukturelement, serif+sans-mix.
+ *
+ * Passer for: medie/magasin, premium-tjenester, kuratert e-handel,
+ * boutique-konsulent, kunst/kultur, mat/restaurant.
+ */
+:root {
+  /* ─── Colors ────────────────────────────────────────────── */
+  /* Premium-svart-på-krem-palette */
+  --color-primary: oklch(15% 0 0);                /* dyp sort */
+  --color-secondary: oklch(95% 0.01 90);          /* warm krem */
+  --color-accent: oklch(55% 0.18 25);             /* rust/terracotta — sjelden */
+
+  --color-bg-primary: oklch(97% 0.005 85);        /* off-white med varm undertone */
+  --color-bg-secondary: oklch(92% 0.01 85);
+  --color-bg-tertiary: oklch(15% 0 0);            /* sort spot-bakgrunn for kontrast */
+  --color-bg-inverse: var(--color-primary);
+
+  --color-text-primary: oklch(15% 0 0);
+  --color-text-secondary: oklch(38% 0.01 85);
+  --color-text-muted: oklch(55% 0.015 85);
+
+  /* ─── Typography — SERIF DISPLAY + SANS BODY ─────────────── */
+  /* Display: tung serif med karakter (Tiempos Headline, GT Sectra, PP Editorial New) */
+  --font-family-display: "Tiempos Headline", "GT Sectra Display", "Migra", Georgia, serif;
+
+  /* Body: nøytral sans (Inter, Söhne) */
+  --font-family-sans: var(--font-inter), "Söhne", -apple-system, sans-serif;
+
+  /* Skala — DRAMATISK kontrast mellom hero og body */
+  --font-size-display-xl: clamp(4rem, 2rem + 9vw, 9rem);  /* feature hero */
+  --font-size-display-lg: clamp(3rem, 1.5rem + 6vw, 6rem);
+
+  /* Linjehøyde tett for display (redaksjonell tetthet) */
+  --line-height-display: 0.95;
+
+  /* ─── Spacing ────────────────────────────────────────────── */
+  /* Editorial puster i SEKSJONER, men er tett i KOLONNER */
+  --section-padding-y: clamp(6rem, 10vw, 12rem);
+  --column-gap: 1rem;                              /* tett bento */
+  --column-gap-lg: 2rem;
+
+  /* ─── Borders ────────────────────────────────────────────── */
+  --border-radius: 0;                              /* INGEN rounded */
+  --border-color: oklch(85% 0.01 85);
+  --border-color-strong: oklch(15% 0 0);
+
+  /* ─── Shadows ────────────────────────────────────────────── */
+  /* Editorial bruker IKKE shadows — kun border + layering for depth */
+  --shadow-none: 0 0 0 transparent;
+}
+
+/* ─── Editorial-spesifikke utility-classes ─────────────────── */
+.editorial-drop-cap::first-letter {
+  /* Stor dropcap på første bokstav i lange paragraphs */
+  font-family: var(--font-family-display);
+  font-size: 4em;
+  line-height: 0.8;
+  float: left;
+  margin: 0.1em 0.15em 0 0;
+  color: var(--color-accent);
+}
+
+.editorial-rule {
+  /* Tynn redaksjonell skillestrek */
+  border-top: 1px solid var(--color-border-strong);
+  margin: var(--section-padding-y) 0;
+}
+
+.editorial-meta {
+  /* Liten meta-tekst (forfatter, dato, kategori) */
+  font-family: var(--font-family-sans);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  color: var(--color-text-muted);
+}

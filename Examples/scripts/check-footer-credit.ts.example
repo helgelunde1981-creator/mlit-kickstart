@@ -1,0 +1,99 @@
+﻿#!/usr/bin/env node
+/**
+ * Footer Credit Check — verifiserer at "Utviklet av Myrvoll-Lunde IT Drift"
+ * + lenke til mlit.no finnes på alle public-ruter.
+ *
+ * Kjør: pnpm tsx scripts/check-footer-credit.ts
+ *
+ * Krever: pnpm start kjører på BASE_URL (default http://localhost:3000)
+ */
+
+import { chromium, type Browser } from 'playwright'
+import path from 'node:path'
+
+const BASE_URL = process.env.BASE_URL ?? 'http://localhost:3000'
+
+const PUBLIC_ROUTES = [
+  '/',
+  '/om-oss',
+  '/kontakt',
+  '/tjenester',
+  '/blogg',
+]
+
+const CREDIT_TEXT_RE = /Utviklet av Myrvoll-Lunde IT Drift/i
+const CREDIT_HREF_RE = /https:\/\/mlit.no/i
+
+interface RouteCheck {
+  route: string
+  hasText: boolean
+  hasLink: boolean
+  passed: boolean
+}
+
+async function checkRoute(browser: Browser, route: string): Promise<RouteCheck> {
+  const page = await browser.newPage()
+  await page.goto(`${BASE_URL}${route}`, { waitUntil: 'networkidle' })
+
+  const footerText = await page.locator('footer').innerText().catch(() => '')
+  const linkCount = await page.locator('footer a[href*="mlit.no"]').count()
+
+  await page.close()
+
+  const hasText = CREDIT_TEXT_RE.test(footerText)
+  const hasLink = linkCount > 0
+
+  return {
+    route,
+    hasText,
+    hasLink,
+    passed: hasText && hasLink,
+  }
+}
+
+async function main(): Promise<void> {
+  const browser = await chromium.launch()
+  const results: RouteCheck[] = []
+
+  for (const route of PUBLIC_ROUTES) {
+    try {
+      results.push(await checkRoute(browser, route))
+    } catch (e) {
+      results.push({ route, hasText: false, hasLink: false, passed: false })
+    }
+  }
+
+  await browser.close()
+
+  const failed = results.filter((r) => !r.passed)
+
+  const report = {
+    timestamp: new Date().toISOString(),
+    baseUrl: BASE_URL,
+    total: results.length,
+    failed: failed.length,
+    results,
+    passed: failed.length === 0,
+  }
+
+  const outDir = path.join(process.cwd(), 'reports')
+  const fs = await import('node:fs/promises')
+  await fs.mkdir(outDir, { recursive: true })
+  await fs.writeFile(path.join(outDir, 'footer-credit.json'), JSON.stringify(report, null, 2))
+
+  if (failed.length === 0) {
+    console.log(`✓ Footer-credit OK — ${results.length}/${results.length} ruter har Myrvoll-Lunde IT Drift-credit`)
+    return
+  }
+
+  console.error(`✗ Footer-credit FAILED — ${failed.length} ruter mangler credit`)
+  for (const r of failed) {
+    console.error(`  ${r.route}  text=${r.hasText ? '✓' : '✗'}  link=${r.hasLink ? '✓' : '✗'}`)
+  }
+  process.exit(1)
+}
+
+main().catch((e) => {
+  console.error('check-footer-credit crashed:', e)
+  process.exit(2)
+})

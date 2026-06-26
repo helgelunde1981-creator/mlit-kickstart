@@ -1,0 +1,231 @@
+/**
+ * check-seo-grid.ts — håndhever §18 «Sted×tjeneste-grid SEO» (S1-S5).
+ *
+ * Åpner ALLE sted×tjeneste-URL-er fra service_locations + scorer mot:
+ *   S1: ≥800 ord innhold i <main>
+ *   S2: JSON-LD Service + LocalBusiness validerer
+ *   S3: Unikt innhold (Jaccard <60% mot andre sider)
+ *   S4: ≥3 FAQ-blokker (AEO)
+ *   S5: ≥3 internal cross-links til andre kombinasjon-sider
+ *
+ * Snitt <4.5/5 → exit 1 (PR-blokk).
+ *
+ * Env:
+ *   TARGET_URL (default http://localhost:3000)
+ *   SUPABASE_URL / NEXT_PUBLIC_SUPABASE_URL
+ *   SUPABASE_SERVICE_ROLE_KEY
+ *   MIN_AVG_SCORE (default 4.5)
+ */
+import { chromium, type Page } from "playwright";
+import { createClient } from "@supabase/supabase-js";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+
+const URL = (process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL)?.trim();
+const KEY = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
+if (!URL || !KEY) {
+  console.error("Mangler SUPABASE_URL/NEXT_PUBLIC_SUPABASE_URL eller SUPABASE_SERVICE_ROLE_KEY");
+  process.exit(1);
+}
+const supabase = createClient(URL, KEY, { auth: { persistSession: false } });
+
+const BASE_URL = (process.env.TARGET_URL || "http://localhost:3000").trim().replace(/\/$/, "");
+const MIN_AVG = parseFloat(process.env.MIN_AVG_SCORE ?? "4.5");
+
+interface GridScore {
+  url: string;
+  s1_words: number;
+  s2_jsonld: boolean;
+  s3_unique: boolean;
+  s4_faq: number;
+  s5_crosslinks: number;
+  score: number; // 0-5
+  details: string[];
+}
+
+function tokenize(s: string): Set<string> {
+  return new Set(
+    s.toLowerCase()
+      .replace(/[^\wæøå\s]/g, " ")
+      .split(/\s+/)
+      .filter((t) => t.length >= 4),
+  );
+}
+
+function jaccard(a: Set<string>, b: Set<string>): number {
+  const intersection = [...a].filter((t) => b.has(t)).length;
+  const union = new Set([...a, ...b]).size;
+  return union === 0 ? 0 : intersection / union;
+}
+
+async function fetchAllUrls(): Promise<string[]> {
+  // Heuristikk: hent fra service_locations-tabellen (eller pages med slug-mønster)
+  const { data: sls } = await supabase
+    .from("service_locations")
+    .select("service_slug, location_slug")
+    .eq("is_published", true);
+  if (sls && sls.length > 0) {
+    return sls.map((s) => `/${s.service_slug}/${s.location_slug}`);
+  }
+  // Fallback: sitemap-mønster
+  const { data: pages } = await supabase
+    .from("pages")
+    .select("slug")
+    .eq("is_published", true)
+    .like("slug", "/%/%");
+  return pages?.map((p) => p.slug) ?? [];
+}
+
+async function scoreOne(page: Page, slug: string, allBodies: Map<string, Set<string>>): Promise<GridScore> {
+  const url = `${BASE_URL}${slug}`;
+  const details: string[] = [];
+
+  await page.goto(url, { waitUntil: "networkidle", timeout: 30000 });
+  await page.waitForTimeout(500);
+
+  // S1: ordtelling i <main>
+  const wordCount = await page.evaluate(() => {
+    const main = document.querySelector("main");
+    if (!main) return 0;
+    const text = (main.textContent ?? "").trim();
+    return text.split(/\s+/).filter(Boolean).length;
+  });
+  const s1 = wordCount >= 800;
+  if (!s1) details.push(`S1: ${wordCount} ord (krav 800)`);
+
+  // S2: JSON-LD Service + LocalBusiness
+  const ldScripts = await page.locator('script[type="application/ld+json"]').allTextContents();
+  const types = new Set<string>();
+  for (const s of ldScripts) {
+    try {
+      const parsed = JSON.parse(s);
+      const arr = Array.isArray(parsed) ? parsed : [parsed];
+      for (const obj of arr) {
+        if (obj["@type"]) types.add(obj["@type"]);
+        if (obj["@graph"]) {
+          for (const g of obj["@graph"]) {
+            if (g["@type"]) types.add(g["@type"]);
+          }
+        }
+      }
+    } catch {
+      // skip invalid JSON
+    }
+  }
+  const s2 = types.has("Service") && (types.has("LocalBusiness") || types.has("Organization"));
+  if (!s2) details.push(`S2: JSON-LD mangler (har: ${[...types].join(",") || "ingen"})`);
+
+  // S3: unikt innhold (fyll allBodies + jaccard mot andre)
+  const bodyText = await page.evaluate(() => {
+    const main = document.querySelector("main");
+    return main?.textContent ?? "";
+  });
+  const thisTokens = tokenize(bodyText);
+  allBodies.set(slug, thisTokens);
+  let maxOverlap = 0;
+  let overlapWith = "";
+  for (const [otherSlug, otherTokens] of allBodies) {
+    if (otherSlug === slug) continue;
+    const sim = jaccard(thisTokens, otherTokens);
+    if (sim > maxOverlap) {
+      maxOverlap = sim;
+      overlapWith = otherSlug;
+    }
+  }
+  const s3 = maxOverlap < 0.6 || allBodies.size === 1; // første side får pass
+  if (!s3) details.push(`S3: ${(maxOverlap * 100).toFixed(0)}% overlap m/${overlapWith}`);
+
+  // S4: FAQ-blokker
+  const faqCount = await page.locator(
+    '[itemtype*="FAQPage"] [itemtype*="Question"], section.faq dt, section[class*="faq"] h3, [data-faq-item]',
+  ).count();
+  const s4 = faqCount >= 3;
+  if (!s4) details.push(`S4: ${faqCount} FAQ (krav 3)`);
+
+  // S5: cross-links til andre kombinasjons-sider
+  const crossLinks = await page.locator('main a[href*="/"], footer a[href*="/"]').evaluateAll((els) => {
+    return els.filter((el) => {
+      const href = (el as HTMLAnchorElement).getAttribute("href") ?? "";
+      // Match /<word>/<word>-mønster (kombinasjon-side)
+      return /^\/[a-zæøå][a-zæøå0-9-]*\/[a-zæøå][a-zæøå0-9-]*$/i.test(href);
+    }).length;
+  });
+  const s5 = crossLinks >= 3;
+  if (!s5) details.push(`S5: ${crossLinks} cross-links (krav 3)`);
+
+  const score = [s1, s2, s3, s4, s5].filter(Boolean).length;
+  return { url, s1_words: wordCount, s2_jsonld: s2, s3_unique: s3, s4_faq: faqCount, s5_crosslinks: crossLinks, score, details };
+}
+
+async function main() {
+  const urls = await fetchAllUrls();
+  if (urls.length === 0) {
+    console.error("Ingen sted×tjeneste-URL-er funnet i DB (service_locations eller pages med /X/Y-mønster).");
+    console.error("Hvis dette er et prosjekt UTEN sted×tjeneste-grid: skip dette skriptet.");
+    process.exit(0);
+  }
+
+  console.log(`Sjekker ${urls.length} sted×tjeneste-sider mot ${BASE_URL}\n`);
+
+  const browser = await chromium.launch();
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const allBodies = new Map<string, Set<string>>();
+  const results: GridScore[] = [];
+
+  for (const url of urls) {
+    const page = await context.newPage();
+    console.log(`→ ${url}`);
+    const r = await scoreOne(page, url, allBodies).catch((e) => ({
+      url: `${BASE_URL}${url}`,
+      s1_words: 0,
+      s2_jsonld: false,
+      s3_unique: false,
+      s4_faq: 0,
+      s5_crosslinks: 0,
+      score: 0,
+      details: [`Exception: ${(e as Error).message}`],
+    }));
+    results.push(r);
+    console.log(`   ${r.score >= MIN_AVG ? "✅" : "❌"} ${r.score}/5  ${r.details.join(" · ")}`);
+    await page.close();
+  }
+  await browser.close();
+
+  const avg = results.reduce((s, r) => s + r.score, 0) / results.length;
+  const failing = results.filter((r) => r.score < MIN_AVG);
+
+  const report = [
+    `# SEO-grid-rapport`,
+    `Generert: ${new Date().toISOString()}`,
+    `Target: ${BASE_URL}`,
+    `Krav: snitt ≥${MIN_AVG.toFixed(1)}/5`,
+    ``,
+    `**Snitt:** ${avg.toFixed(2)}/5`,
+    `**Sider:** ${results.length}`,
+    `**Under terskel:** ${failing.length}`,
+    ``,
+    `## Per-side`,
+    ``,
+    ...results.map((r) => `### ${r.url} — ${r.score}/5\n\n${r.details.length ? r.details.map((d) => `- ❌ ${d}`).join("\n") : "✅ Alle 5 sjekker bestått"}\n`),
+  ].join("\n");
+
+  const reportDir = join(process.cwd(), "docs", "sprint-reports");
+  await mkdir(reportDir, { recursive: true });
+  const reportPath = join(reportDir, `seo-grid-${Date.now()}.md`);
+  await writeFile(reportPath, report);
+
+  console.log(`\n📊 Rapport: ${reportPath}`);
+  console.log(`   Snitt: ${avg.toFixed(2)}/5  ·  Under terskel: ${failing.length}/${results.length}`);
+
+  if (avg < MIN_AVG) {
+    console.error(`\n❌ SEO-grid FAILED — snitt ${avg.toFixed(2)} under ${MIN_AVG}`);
+    process.exit(1);
+  }
+
+  console.log(`\n✅ SEO-grid OK — snitt ≥${MIN_AVG}`);
+}
+
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});

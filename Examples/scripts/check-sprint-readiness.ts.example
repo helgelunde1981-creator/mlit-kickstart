@@ -1,0 +1,155 @@
+/**
+ * check-sprint-readiness.ts — meta-sjekk for "AI rapporterer 10/10 uten å ha kjørt sjekkene"
+ *
+ * Hvorfor (Container Consult, mai 2026):
+ *   AI-instans rapporterte 'K1-K5 alle grønne, snitt 10.00/10' — men:
+ *   - CI var rødt i timer på tsc-feil
+ *   - SEO-grid var 1.80/5 (aldri kjørt)
+ *   - Visual quality var 3.1/10 (aldri kjørt)
+ *
+ *   AI hadde bare kjørt check-public-pages.ts og kalt det "ferdig". Alle
+ *   andre check-skripter ble glemt.
+ *
+ * Denne sjekken: leser SISTE sprint-rapport i docs/sprint-reports/sprint-<N>-final.md
+ * og verifiserer at den har output-stempel fra ALLE påkrevde check-skripter
+ * basert på prosjektets konfigurasjon.
+ *
+ * Brukes som siste skritt før AI får rapportere "sprint ferdig" — eller som
+ * blokk i quality-gate.yml hvis siste sluttrapport ikke har full coverage.
+ *
+ * Kjør lokalt:
+ *   pnpm tsx scripts/check-sprint-readiness.ts <sprint-number>
+ *   pnpm tsx scripts/check-sprint-readiness.ts        # auto-finn siste
+ */
+import { readdir, readFile } from "node:fs/promises";
+import { join } from "node:path";
+
+const SPRINT_REPORTS_DIR = join(process.cwd(), "docs", "sprint-reports");
+
+// Hver entry er en sjekk som MÅ ha vært kjørt + dokumentert i sluttrapporten.
+// "marker" er en string som skal finnes i rapport-fila (output-fragment som
+// bare kan komme fra at skriptet faktisk har kjørt).
+const REQUIRED_CHECKS: Array<{
+  name: string;
+  marker_regex: RegExp;
+  always_required: boolean;
+  conditional_marker?: string; // hvis satt: kun påkrevd hvis denne stringen finnes i PROJECT.md
+}> = [
+  {
+    name: "check-public-pages.ts (per-side 10/10)",
+    marker_regex: /Per-side|sprint-quality-\d+\.md|snitt[^/]*\d+\.?\d*\s*\/\s*10/i,
+    always_required: true,
+  },
+  {
+    name: "check-no-hardcoding.sh (§33)",
+    marker_regex: /check-no-hardcoding|hardkoding-forbud|§33/i,
+    always_required: true,
+  },
+  {
+    name: "check-anti-template.sh (§34)",
+    marker_regex: /check-anti-template|anti-template|§34/i,
+    always_required: true,
+  },
+  {
+    name: "check-wizard-coverage.ts (§35)",
+    marker_regex: /check-wizard-coverage|wizard.{0,10}coverage|§35/i,
+    always_required: true,
+  },
+  {
+    name: "check-visual-quality.ts (§36 V1-V5)",
+    marker_regex: /check-visual-quality|V1-V5|vision.{0,15}snitt|§36/i,
+    always_required: true,
+  },
+  {
+    name: "check-mobile-quality.ts (§39 M1-M6)",
+    marker_regex: /check-mobile-quality|M1-M6|mobile.{0,15}snitt|sprint-\d+-mobile|§39/i,
+    always_required: true,
+  },
+  {
+    name: "check-seo-grid.ts (§18 S1-S5)",
+    marker_regex: /check-seo-grid|S1-S5|sted×tjeneste|sted-tjeneste-grid/i,
+    always_required: false,
+    conditional_marker: "service_locations", // kun hvis prosjektet har sted×tjeneste-grid
+  },
+  {
+    name: "verify-data-parity.ts (§32 dev=prod)",
+    marker_regex: /verify-data-parity|data-paritet|prod.?=.?dev/i,
+    always_required: false,
+    conditional_marker: "supabase_branching",
+  },
+];
+
+async function findLatestSprintReport(sprintArg?: string): Promise<string | null> {
+  const files = await readdir(SPRINT_REPORTS_DIR).catch(() => []);
+  const finals = files.filter((f) => /^sprint-(\d+(?:\.\d+)?)-final\.md$/.test(f));
+
+  if (finals.length === 0) {
+    console.error(`Ingen sluttrapport funnet i ${SPRINT_REPORTS_DIR}/sprint-*-final.md`);
+    return null;
+  }
+
+  if (sprintArg) {
+    const target = `sprint-${sprintArg}-final.md`;
+    if (finals.includes(target)) return join(SPRINT_REPORTS_DIR, target);
+    console.error(`sprint-${sprintArg}-final.md finnes ikke. Tilgjengelige: ${finals.join(", ")}`);
+    return null;
+  }
+
+  // Sortér etter sprint-nummer
+  finals.sort((a, b) => {
+    const na = parseFloat(a.match(/sprint-([\d.]+)-/)?.[1] ?? "0");
+    const nb = parseFloat(b.match(/sprint-([\d.]+)-/)?.[1] ?? "0");
+    return nb - na;
+  });
+  return join(SPRINT_REPORTS_DIR, finals[0]);
+}
+
+async function projectHasFeature(marker: string): Promise<boolean> {
+  const projectMd = await readFile(join(process.cwd(), "PROJECT.md"), "utf-8").catch(() => "");
+  return projectMd.toLowerCase().includes(marker.toLowerCase());
+}
+
+async function main() {
+  const arg = process.argv[2];
+  const reportPath = await findLatestSprintReport(arg);
+  if (!reportPath) {
+    process.exit(1);
+  }
+
+  const report = await readFile(reportPath, "utf-8");
+  console.log(`📋 Sjekker: ${reportPath}\n`);
+
+  const missing: string[] = [];
+  const passed: string[] = [];
+
+  for (const check of REQUIRED_CHECKS) {
+    if (!check.always_required) {
+      if (!check.conditional_marker || !(await projectHasFeature(check.conditional_marker))) {
+        passed.push(`⏭  ${check.name} (ikke relevant for prosjektet)`);
+        continue;
+      }
+    }
+
+    if (check.marker_regex.test(report)) {
+      passed.push(`✅ ${check.name}`);
+    } else {
+      missing.push(`❌ ${check.name} — ingen output funnet i sluttrapport`);
+    }
+  }
+
+  passed.forEach((p) => console.log(`   ${p}`));
+
+  if (missing.length > 0) {
+    console.error(`\n🚫 Sprint kan IKKE rapporteres ferdig — ${missing.length} check-skript mangler i ${reportPath}:`);
+    missing.forEach((m) => console.error(`   ${m}`));
+    console.error(`\n   Kjør hver manglende check-skript, legg output i ${reportPath}, og prøv igjen.`);
+    process.exit(1);
+  }
+
+  console.log(`\n✅ Sprint klar for ferdigrapport — ${passed.length} check-skript verifisert i sluttrapport`);
+}
+
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});

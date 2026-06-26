@@ -1,0 +1,126 @@
+#!/usr/bin/env node
+/**
+ * Lighthouse Check — kjør Lighthouse mot alle public-ruter.
+ * Krav: Performance, Accessibility, BestPractices, SEO alle ≥ 95.
+ *
+ * Kjør: pnpm tsx scripts/check-lighthouse.ts
+ * Krever: BASE_URL kjører, lighthouse + chrome-launcher installert.
+ */
+
+import lighthouse from 'lighthouse'
+import * as chromeLauncher from 'chrome-launcher'
+import path from 'node:path'
+import { writeFile, mkdir } from 'node:fs/promises'
+
+const BASE_URL = process.env.BASE_URL ?? 'http://localhost:3000'
+
+const ROUTES = ['/', '/om-oss', '/kontakt', '/tjenester']
+
+const TERSKEL = {
+  performance: 95,
+  accessibility: 95,
+  'best-practices': 95,
+  seo: 95,
+}
+
+interface RouteScore {
+  route: string
+  performance: number
+  accessibility: number
+  bestPractices: number
+  seo: number
+  passed: boolean
+}
+
+async function runLighthouse(url: string, port: number): Promise<RouteScore> {
+  const result = await lighthouse(url, {
+    port,
+    output: 'html',
+    logLevel: 'error',
+    onlyCategories: ['performance', 'accessibility', 'best-practices', 'seo'],
+    formFactor: 'mobile',
+    screenEmulation: {
+      mobile: true,
+      width: 360,
+      height: 640,
+      deviceScaleFactor: 2,
+      disabled: false,
+    },
+  })
+
+  if (!result) throw new Error(`Lighthouse failed for ${url}`)
+
+  const score = (key: string) => Math.round(((result.lhr.categories[key]?.score ?? 0) * 100))
+  const performance = score('performance')
+  const accessibility = score('accessibility')
+  const bestPractices = score('best-practices')
+  const seo = score('seo')
+
+  // Save HTML report
+  const outDir = path.join(process.cwd(), 'reports/lighthouse')
+  await mkdir(outDir, { recursive: true })
+  const safeName = url.replace(/[^a-z0-9]/gi, '_') || 'root'
+  await writeFile(path.join(outDir, `${safeName}.html`), result.report as string)
+
+  const passed =
+    performance >= TERSKEL.performance &&
+    accessibility >= TERSKEL.accessibility &&
+    bestPractices >= TERSKEL['best-practices'] &&
+    seo >= TERSKEL.seo
+
+  return {
+    route: url.replace(BASE_URL, ''),
+    performance,
+    accessibility,
+    bestPractices,
+    seo,
+    passed,
+  }
+}
+
+async function main(): Promise<void> {
+  const chrome = await chromeLauncher.launch({ chromeFlags: ['--headless'] })
+  const results: RouteScore[] = []
+
+  try {
+    for (const route of ROUTES) {
+      try {
+        results.push(await runLighthouse(`${BASE_URL}${route}`, chrome.port))
+      } catch (e) {
+        console.error(`Lighthouse crashed on ${route}:`, e)
+      }
+    }
+  } finally {
+    await chrome.kill()
+  }
+
+  const failed = results.filter((r) => !r.passed)
+
+  const report = {
+    timestamp: new Date().toISOString(),
+    baseUrl: BASE_URL,
+    terskel: TERSKEL,
+    results,
+    passed: failed.length === 0,
+  }
+
+  await writeFile(
+    path.join(process.cwd(), 'reports/lighthouse/summary.json'),
+    JSON.stringify(report, null, 2)
+  )
+
+  console.table(results)
+
+  if (failed.length === 0) {
+    console.log(`✓ Lighthouse OK — alle ${results.length} ruter ≥ 95 alle 4 kategorier`)
+    return
+  }
+
+  console.error(`✗ Lighthouse FAILED — ${failed.length}/${results.length} ruter under terskel`)
+  process.exit(1)
+}
+
+main().catch((e) => {
+  console.error('check-lighthouse crashed:', e)
+  process.exit(2)
+})

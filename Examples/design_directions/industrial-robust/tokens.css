@@ -1,0 +1,99 @@
+/**
+ * Industrial / Robust — design-tokens
+ * Karakteristikker: tunge fotografi, mørke metalliske tokens, hard-shadow,
+ * kondensert tung sans, gul/rød accent, gjentakende bilde-motiv.
+ *
+ * Brukt i: Container Consult AS (containerutleie/transport på Sunnmøre).
+ * Ville passet for: byggeentreprenør, industri/produksjon, transport,
+ * gjenvinning, anleggsmaskiner, store entrepriser.
+ */
+:root {
+  /* ─── Colors ────────────────────────────────────────────── */
+  /* Primary: signal-gul (varselfarge, industri-koding) */
+  --color-primary: oklch(78% 0.18 95);            /* #F5C500 */
+  --color-primary-dark: oklch(60% 0.17 85);       /* #B89200 — for hover */
+
+  /* Secondary: dyp sort (containere, industriasfalt) */
+  --color-secondary: oklch(15% 0 0);              /* #1A1A1A */
+
+  /* Accent: signal-rød (sjelden brukt, kun for fare/feil/oppmerksomhet) */
+  --color-danger: oklch(58% 0.21 25);             /* #CC2A1A */
+
+  /* Backgrounds: industrigrå, ikke "soft beige" */
+  --color-bg-primary: oklch(98% 0 0);             /* nesten-hvit, ikke krem */
+  --color-bg-secondary: oklch(94% 0 0);           /* lys betong */
+  --color-bg-tertiary: oklch(20% 0 0);            /* mørk asfalt, brukt på industri-seksjoner */
+  --color-bg-inverse: var(--color-secondary);
+
+  /* Tekst: høy kontrast, ingen blå-undertone */
+  --color-text-primary: oklch(14% 0 0);
+  --color-text-secondary: oklch(35% 0 0);
+  --color-text-muted: oklch(50% 0 0);
+  --color-text-inverse: oklch(98% 0 0);
+
+  /* ─── Typography ─────────────────────────────────────────── */
+  /* Display: KONDENSERT TUNG SANS (Barlow Condensed Black / Bebas Neue / Anton).
+     ALDRI Inter_Tight eller andre soft tech-sans — det leser som SaaS, ikke industri. */
+  --font-family-display: var(--font-barlow-condensed), "Barlow Condensed", "Bebas Neue",
+                         "Arial Narrow", sans-serif;
+
+  /* Body: nøytral, lesbar sans. Inter er OK — men kun for body, ikke display. */
+  --font-family-sans: var(--font-inter), "Inter", -apple-system, sans-serif;
+
+  /* Mono: industri-monospace for tall, koder, ID-er */
+  --font-family-mono: var(--font-jetbrains-mono), "JetBrains Mono", monospace;
+
+  /* Display-skala — tung og stor. Industrial vil DOMINERE. */
+  --font-size-display-sm: clamp(2.5rem, 1.8rem + 3vw, 4rem);
+  --font-size-display-md: clamp(3rem, 2rem + 5vw, 6rem);
+  --font-size-display-lg: clamp(4rem, 2.5rem + 7vw, 8rem);    /* hero-hovedtittel */
+
+  /* ─── Shadows ────────────────────────────────────────────── */
+  /* Hard-shadow uten blur. Ingen "soft elevation". */
+  --shadow-hard-sm: 4px 4px 0 oklch(0% 0 0 / 0.3);
+  --shadow-hard: 8px 8px 0 oklch(0% 0 0 / 0.4);
+  --shadow-hard-lg: 12px 12px 0 oklch(0% 0 0 / 0.5);
+
+  /* ─── Borders ────────────────────────────────────────────── */
+  --border-radius: 0;                              /* INGEN rounded corners */
+  --border-radius-sm: 2px;                         /* unntak: form-input-fokus */
+  --border-color: oklch(85% 0 0);
+  --border-color-strong: oklch(60% 0 0);
+
+  /* ─── Spacing ────────────────────────────────────────────── */
+  /* Større, dramatiske mellomrom. Industri puster. */
+  --section-padding-y: clamp(4rem, 8vw, 8rem);
+  --container-max-w: 1200px;
+}
+
+/* ─── Industrial-spesifikke utility-classes ────────────────── */
+.industrial-stripe {
+  /* Gjengivelse av sikkerhetsstriper (gul/sort) — brukes på topp/bunn av seksjoner */
+  background-image: repeating-linear-gradient(
+    -45deg,
+    var(--color-primary),
+    var(--color-primary) 16px,
+    var(--color-secondary) 16px,
+    var(--color-secondary) 32px
+  );
+  height: 8px;
+}
+
+.industrial-kicker {
+  /* Liten mono-kicker over heading, signaliserer "industri-merking" */
+  font-family: var(--font-family-mono);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.3em;
+  color: var(--color-primary);
+}
+
+.industrial-vignette-left {
+  /* Hero-vignett kun venstre + bunn (bildet skal dominere høyre del) */
+  background: linear-gradient(
+    to right,
+    oklch(0% 0 0 / 0.8) 0%,
+    oklch(0% 0 0 / 0.4) 40%,
+    transparent 70%
+  );
+}

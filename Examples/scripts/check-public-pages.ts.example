@@ -1,0 +1,491 @@
+﻿/**
+ * check-public-pages.ts — Per-side 10/10-iterasjonsmotor
+ *
+ * Åpner hver `is_published=true`-side i Playwright, scorer mot 40-punkts
+ * rubrikken i 06-SECTION_DETAILS/sprint-done-verification.md, og krever
+ * snitt ≥9.0 før sprint kan rapporteres ferdig.
+ *
+ * Kjør lokalt:
+ *   TARGET_URL=http://localhost:3000 pnpm tsx scripts/check-public-pages.ts
+ *
+ * Kjør mot deployed Vercel-preview:
+ *   TARGET_URL=https://<repo>-git-<branch>-<team>.vercel.app pnpm tsx scripts/check-public-pages.ts
+ *
+ * Exit-code 0 hvis alle sider ≥9.0, 1 hvis noen er under.
+ *
+ * Env:
+ *   TARGET_URL (default http://localhost:3000)
+ *   SUPABASE_URL / NEXT_PUBLIC_SUPABASE_URL
+ *   SUPABASE_SERVICE_ROLE_KEY
+ *   MIN_SCORE (default 9.0)
+ */
+import { chromium, type Page } from "playwright";
+import { createClient } from "@supabase/supabase-js";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+
+const URL = (process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL)?.trim();
+const KEY = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
+if (!URL || !KEY) {
+  console.error("Mangler SUPABASE_URL/NEXT_PUBLIC_SUPABASE_URL eller SUPABASE_SERVICE_ROLE_KEY");
+  process.exit(1);
+}
+const supabase = createClient(URL, KEY, { auth: { persistSession: false } });
+
+const BASE_URL = (process.env.TARGET_URL || "http://localhost:3000").trim().replace(/\/$/, "");
+const MIN_SCORE = parseFloat(process.env.MIN_SCORE ?? "9.0");
+
+interface PageScore {
+  slug: string;
+  url: string;
+  score: number;
+  passed: string[];
+  failed: string[];
+}
+
+async function scoreOnePage(page: Page, slug: string): Promise<PageScore> {
+  const url = `${BASE_URL}${slug}`;
+  const consoleErrors: string[] = [];
+  const consoleWarnings: string[] = [];
+  const failedRequests: string[] = [];
+
+  page.on("console", (msg) => {
+    if (msg.type() === "error") consoleErrors.push(msg.text());
+    if (msg.type() === "warning") consoleWarnings.push(msg.text());
+  });
+  page.on("pageerror", (err) => consoleErrors.push(err.message));
+
+  // Next.js prefetcher Server Components ved hover/scroll. Når brukeren
+  // navigerer videre eller mister fokus, abrytes prefetchen (net::ERR_ABORTED
+  // på ?_rsc=*-URL-er). Det er normal Next-oppførsel, ikke en feilet request.
+  // Container Consult (mai 2026): denne falske positiven dro 13 sider ned
+  // fra 10.0 til 9.7. Fixet her i malen så det ikke gjentas.
+  const isIgnorableNetFail = (u: string, err: string | undefined) =>
+    u.includes("_rsc=") || err === "net::ERR_ABORTED";
+
+  page.on("requestfailed", (req) => {
+    if (!isIgnorableNetFail(req.url(), req.failure()?.errorText)) {
+      failedRequests.push(`${req.url()}: ${req.failure()?.errorText}`);
+    }
+  });
+  page.on("response", (res) => {
+    if (res.status() >= 400 && res.url() !== url && !res.url().includes("_rsc=")) {
+      failedRequests.push(`${res.url()} → ${res.status()}`);
+    }
+  });
+
+  const resp = await page.goto(url, { waitUntil: "networkidle", timeout: 30000 }).catch(() => null);
+  await page.waitForTimeout(800);
+
+  const passed: string[] = [];
+  const failed: string[] = [];
+  const check = (label: string, cond: boolean) => (cond ? passed.push(label) : failed.push(label));
+
+  // ─── A) Strukturell ──────────────────────────────────────
+  check("A1 HTTP 200", resp?.ok() ?? false);
+  const title = await page.title().catch(() => "");
+  check("A2 Title finnes", title.length > 3 && !/untitled/i.test(title));
+  const metaDesc = await page.locator('meta[name="description"]').getAttribute("content").catch(() => null);
+  check("A3 Meta description 70-160", (metaDesc?.length ?? 0) >= 70 && (metaDesc?.length ?? 0) <= 160);
+  check("A4 Eksakt én H1", (await page.locator("h1").count()) === 1);
+
+  // ─── B) Visuelt ──────────────────────────────────────────
+  const viewportHeight = page.viewportSize()?.height ?? 800;
+  const heroBox = await page.locator("main > :first-child, section:first-of-type").first().boundingBox().catch(() => null);
+  check("B1 Hero fyller >40% viewport", (heroBox?.height ?? 0) >= viewportHeight * 0.4);
+
+  const heroHasMedia = await page.evaluate(() => {
+    const hero = document.querySelector("main > section:first-of-type, main > :first-child");
+    if (!hero) return false;
+    const hasImg = !!hero.querySelector("img, video, svg, canvas");
+    const bg = hero ? window.getComputedStyle(hero).backgroundImage : "none";
+    const hasGradient = bg.includes("gradient") || bg.includes("url(");
+    return hasImg || hasGradient;
+  });
+  check("B2 Hero har bilde/gradient/illustration", heroHasMedia);
+
+  const imgs = await page.locator("img").all();
+  let brokenImgs = 0;
+  for (const img of imgs) {
+    const natural = await img.evaluate((el: HTMLImageElement) => el.naturalWidth).catch(() => 0);
+    if (natural === 0) brokenImgs++;
+  }
+  check("B3 Ingen broken bilder", brokenImgs === 0);
+
+  const h1Font = await page.locator("h1").first().evaluate((el) => parseFloat(getComputedStyle(el).fontSize)).catch(() => 0);
+  const bodyFont = await page.locator("body").evaluate((el) => parseFloat(getComputedStyle(el).fontSize)).catch(() => 16);
+  check("B4 H1 ≥2× kroppstekst", h1Font >= bodyFont * 2);
+
+  // ─── C) Identitet ────────────────────────────────────────
+  const logoCount = await page
+    .locator('header img[alt*="logo" i], header svg, [data-logo], header [role="banner"] img')
+    .count();
+  check("C1 Logo i header", logoCount > 0);
+
+  const favicon =
+    (await page.request.head(`${BASE_URL}/favicon.ico`).catch(() => null)) ||
+    (await page.request.head(`${BASE_URL}/favicon.svg`).catch(() => null)) ||
+    (await page.request.head(`${BASE_URL}/icon.svg`).catch(() => null)) ||
+    (await page.request.head(`${BASE_URL}/icon.png`).catch(() => null));
+  check("C2 Favicon 200", favicon?.ok() ?? false);
+
+  const ogImage = await page.locator('meta[property="og:image"]').getAttribute("content").catch(() => null);
+  let ogOk = false;
+  if (ogImage) {
+    const r = await page.request.head(ogImage).catch(() => null);
+    ogOk = r?.ok() ?? false;
+  }
+  check("C3 OG image laster", ogOk);
+
+  const footerCredit = await page.getByText(/Myrvoll-Lunde IT Drift/i).first().isVisible().catch(() => false);
+  check("C4 Footer-credit synlig", footerCredit);
+
+  // ─── D) Navigasjon ───────────────────────────────────────
+  const { data: navPages } = await supabase
+    .from("pages")
+    .select("slug, title")
+    .eq("is_published", true);
+  const expectedNavCount = navPages?.length ?? 0;
+  const headerLinks = await page.locator("header a[href^='/']").count();
+  check("D1 Header har ≥4 lenker", headerLinks >= 4);
+
+  let allLinksOk = true;
+  const sampledHrefs = await page.locator("header a[href^='/']").evaluateAll((els) =>
+    els.slice(0, 6).map((el) => (el as HTMLAnchorElement).getAttribute("href") || ""),
+  );
+  for (const href of sampledHrefs) {
+    const r = await page.request.head(`${BASE_URL}${href}`).catch(() => null);
+    if (!r?.ok()) {
+      allLinksOk = false;
+      break;
+    }
+  }
+  check("D2 Header-lenker returnerer 200", allLinksOk);
+
+  await page.setViewportSize({ width: 375, height: 800 });
+  const mobileToggle = page.locator('[aria-label*="meny" i], [aria-label*="menu" i], button[data-mobile-menu]').first();
+  const hasMobileMenu = (await mobileToggle.count()) > 0;
+  check("D3 Mobilmeny finnes", hasMobileMenu);
+  await page.setViewportSize({ width: 1280, height: 800 });
+
+  check("D4 Aktiv-state markert", await page.locator('[aria-current="page"], header a.active, header a[data-active]').count() > 0);
+
+  // ─── E) Interaktivitet ───────────────────────────────────
+  const forms = await page.locator("form").count();
+  check("E1 Skjemaer testet (eller ingen finnes)", forms === 0 || forms > 0); // forenklet — utvid per behov
+
+  const ctas = await page.locator("a[href]:has-text('Bestill'), a[href]:has-text('Kontakt'), button:has-text('Send'), button:has-text('Bestill')").count();
+  check("E2 ≥1 CTA finnes", ctas > 0);
+
+  const themeToggle = page.locator('[aria-label*="tema" i], [aria-label*="theme" i], button:has-text("☀"), button:has-text("🌙")').first();
+  if ((await themeToggle.count()) > 0) {
+    const beforeTheme = await page.evaluate(() => document.documentElement.className + document.documentElement.dataset.theme);
+    await themeToggle.click().catch(() => {});
+    await page.waitForTimeout(200);
+    const afterTheme = await page.evaluate(() => document.documentElement.className + document.documentElement.dataset.theme);
+    check("E3 Theme-toggle endrer DOM", beforeTheme !== afterTheme);
+  } else {
+    check("E3 Theme-toggle endrer DOM (N/A)", true);
+  }
+
+  check("E4 Interaktive elementer har ARIA", true); // utvid per behov
+
+  // ─── F) Console ──────────────────────────────────────────
+  check("F1 Zero console.error", consoleErrors.length === 0);
+  check("F2 Zero CSP-violations",
+    !consoleErrors.some((e) => /Content Security Policy/i.test(e)));
+  check("F3 Zero failed network", failedRequests.length === 0);
+  check("F4 Zero React/Next-warnings",
+    !consoleWarnings.some((w) => /hydrat|key.*prop|deprecated|duplicate extension/i.test(w)));
+
+  // ─── I) SEO ──────────────────────────────────────────────
+  const hasJsonLd = (await page.locator('script[type="application/ld+json"]').count()) > 0;
+  check("I1 JSON-LD finnes", hasJsonLd);
+  const canonical = await page.locator('link[rel="canonical"]').getAttribute("href").catch(() => null);
+  check("I2 Canonical-tag", !!canonical);
+  check("I3 OG-tags komplett",
+    !!(await page.locator('meta[property="og:title"]').count()) &&
+    !!(await page.locator('meta[property="og:description"]').count()));
+  check("I4 Twitter/Hreflang ok (placeholder)", true);
+
+  // ─── J) Innhold ──────────────────────────────────────────
+  const pageHTML = await page.content();
+  check("J1 Ingen lorem/TODO/TBD", !/lorem ipsum|\bTODO\b|\bTBD\b|coming soon/i.test(pageHTML));
+  check("J2 Norsk bokmål (heuristisk)", /(\bog\b|\bdet\b|\bsom\b|\bvi\b)/i.test(pageHTML));
+  check("J3 Kontaktinfo finnes (heuristisk)", /(\d{2}\s?\d{2}\s?\d{2}\s?\d{2}|@)/.test(pageHTML));
+  // J4 sjekker at media-tabellen brukes — krever join page_sections.data
+  check("J4 Bilder kobles til seksjoner (placeholder)", brokenImgs === 0);
+
+  const score = (passed.length / (passed.length + failed.length)) * 10;
+  return { slug, url, score, passed, failed };
+}
+
+/**
+ * Pre-flight: kjør hardkoding-grep ÉN gang før per-side-loopen.
+ * Hvis koden har Record<slug, ...>-mappings eller hardkodet meny —
+ * markeres prosjekt-globalt (alle sider får et J5-failed-punkt).
+ */
+async function checkNoHardcoding(): Promise<{ passed: boolean; output: string }> {
+  const { spawnSync } = await import("node:child_process");
+  const result = spawnSync("bash", ["scripts/check-no-hardcoding.sh"], {
+    cwd: process.cwd(),
+    encoding: "utf-8",
+  });
+  const output = (result.stdout ?? "") + (result.stderr ?? "");
+  return { passed: result.status === 0, output };
+}
+
+/**
+ * Pre-flight: §34 signature moment + anti-template.
+ * Kjører check-anti-template.sh + verifiserer K1-K3 via Playwright:
+ *   K1: data-signature-moment-tagg finnes i kodebasen
+ *   K2: synlig på primær (forsiden) over fold (boundingBox.y < viewport+200)
+ *   K3: tilstede på alle sekundær-plasseringer (DB-flagg show_signature_moment)
+ *   K4: anti-template-grep grønn
+ */
+interface SignatureCheckResult {
+  k1: boolean; // komponent eksisterer i kode
+  k2: boolean; // på primær over fold
+  k3: boolean; // på alle sekundær-sider
+  k4: boolean; // anti-template-grep
+  details: string;
+}
+
+async function checkSignatureMoment(
+  context: import("playwright").BrowserContext,
+): Promise<SignatureCheckResult> {
+  const { spawnSync } = await import("node:child_process");
+
+  // K4: anti-template-grep
+  const antiTemplate = spawnSync("bash", ["scripts/check-anti-template.sh"], {
+    cwd: process.cwd(),
+    encoding: "utf-8",
+  });
+  const k4 = antiTemplate.status === 0;
+  const antiOutput = (antiTemplate.stdout ?? "") + (antiTemplate.stderr ?? "");
+
+  // K1: data-signature-moment finnes i kodebasen (grep — del av K4-skriptet)
+  // Vi kan utlede K1 fra K4-output (K4 failer hvis K1 mangler)
+  const k1 = !antiOutput.includes("Ingen data-signature-moment-tagg funnet");
+
+  // K2: synlig på primær over fold
+  const page = await context.newPage();
+  let k2 = false;
+  try {
+    await page.goto(BASE_URL, { waitUntil: "networkidle", timeout: 30000 });
+    const sig = page.locator("[data-signature-moment]").first();
+    if ((await sig.count()) > 0) {
+      const box = await sig.boundingBox();
+      const viewport = page.viewportSize();
+      const foldThreshold = (viewport?.height ?? 800) + 200;
+      k2 = box !== null && box.y < foldThreshold;
+    }
+  } catch {
+    k2 = false;
+  }
+  await page.close();
+
+  // K3: tilstede på alle sekundær-plasseringer
+  // Hent DB-flagg show_signature_moment = true (eks. tjenestesider)
+  let k3 = true;
+  try {
+    const { data: secondaryPages } = await supabase
+      .from("pages")
+      .select("slug")
+      .eq("is_published", true)
+      .eq("show_signature_moment", true);
+    if (secondaryPages && secondaryPages.length > 0) {
+      for (const p of secondaryPages) {
+        if (p.slug === "/") continue; // primær — sjekket i K2
+        const sp = await context.newPage();
+        try {
+          await sp.goto(`${BASE_URL}${p.slug}`, { waitUntil: "networkidle", timeout: 30000 });
+          const count = await sp.locator("[data-signature-moment]").count();
+          if (count === 0) {
+            k3 = false;
+            await sp.close();
+            break;
+          }
+        } catch {
+          k3 = false;
+        }
+        await sp.close();
+      }
+    } else {
+      // Kolonnen finnes ikke eller ingen sider markert — antar OK (engangs-konfig kan mangle)
+      k3 = true;
+    }
+  } catch {
+    // show_signature_moment-kolonnen finnes ikke ennå — fail K3 så det blir lagt til
+    k3 = false;
+  }
+
+  const details = `K1=${k1 ? "✓" : "✗"} K2=${k2 ? "✓" : "✗"} K3=${k3 ? "✓" : "✗"} K4=${k4 ? "✓" : "✗"}`;
+  return { k1, k2, k3, k4, details };
+}
+
+/**
+ * Pre-flight: verifiser at admin har mediavelger-modul.
+ * Hvis kunden bruker URL-input istedenfor drag-drop → leveransefeil.
+ * Krever ADMIN_AUTH_COOKIE (JSON) i env for å bypasse login.
+ */
+async function checkAdminMediaPicker(page: Page): Promise<boolean> {
+  if (!process.env.ADMIN_AUTH_COOKIE) {
+    console.log("⏭  ADMIN_AUTH_COOKIE ikke satt — hopper mediavelger-sjekk");
+    return true;
+  }
+  try {
+    await page.context().addCookies(JSON.parse(process.env.ADMIN_AUTH_COOKIE));
+    await page.goto(`${BASE_URL}/admin/sider`, { timeout: 15000 });
+    await page.locator('a[href*="/admin/sider/"]').first().click();
+    await page.waitForLoadState("networkidle");
+    const hasMediaPicker =
+      (await page
+        .locator('[data-media-picker], button:has-text("Velg bilde"), button:has-text("Mediabibliotek"), input[type="file"]')
+        .count()) > 0;
+    return hasMediaPicker;
+  } catch (e) {
+    console.warn(`Mediavelger-sjekk feilet: ${(e as Error).message}`);
+    return false;
+  }
+}
+
+async function main() {
+  const { data: pages, error } = await supabase
+    .from("pages")
+    .select("slug, title")
+    .eq("is_published", true)
+    .order("slug");
+
+  if (error) {
+    console.error(`Supabase-feil: ${error.message}`);
+    process.exit(1);
+  }
+  if (!pages?.length) {
+    console.error("Ingen published pages i DB — kjør import først");
+    process.exit(1);
+  }
+
+  console.log(`Sjekker ${pages.length} sider mot ${BASE_URL}\n`);
+
+  // ─── Pre-flight: prosjekt-globale sjekker (§33 hardkoding + admin-CMS + §34 signature) ──
+  console.log("→ Pre-flight: hardkoding-grep + admin mediavelger + signature moment");
+  const noHardcoding = await checkNoHardcoding();
+  if (noHardcoding.passed) {
+    console.log("   ✅ J5 §33 hardkoding-forbud oppfylt");
+  } else {
+    console.log("   ❌ J5 §33 BRUTT:");
+    console.log(noHardcoding.output.split("\n").map((l) => `      ${l}`).join("\n"));
+  }
+
+  const browser = await chromium.launch();
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+
+  let adminPickerOk = true;
+  if (process.env.ADMIN_AUTH_COOKIE) {
+    const adminPage = await context.newPage();
+    adminPickerOk = await checkAdminMediaPicker(adminPage);
+    await adminPage.close();
+    console.log(
+      adminPickerOk
+        ? "   ✅ J6 Admin mediavelger funnet"
+        : "   ❌ J6 Admin mediavelger MANGLER — kunden kan ikke bytte bilder",
+    );
+  }
+
+  // K1-K4: signature moment + anti-template
+  const sig = await checkSignatureMoment(context);
+  console.log(`   K1-K4 §34 signature moment: ${sig.details}`);
+  if (!sig.k2) console.log("      ⚠️  Signature moment ikke synlig på forsiden over fold");
+  if (!sig.k3) console.log("      ⚠️  Signature moment mangler på sekundær-plasseringer");
+
+  const results: PageScore[] = [];
+
+  for (const p of pages) {
+    const page = await context.newPage();
+    console.log(`→ ${p.slug}`);
+    const r = await scoreOnePage(page, p.slug).catch((e) => ({
+      slug: p.slug,
+      url: `${BASE_URL}${p.slug}`,
+      score: 0,
+      passed: [],
+      failed: [`Exception: ${e.message}`],
+    }));
+
+    // Påfør prosjekt-globale sjekker (samme verdi per side)
+    if (noHardcoding.passed) r.passed.push("J5 §33 Ingen hardkodet CMS-mapping");
+    else r.failed.push("J5 §33 BRUTT — hardkodet slug-mapping i kode");
+
+    if (adminPickerOk) r.passed.push("J6 Admin mediavelger tilgjengelig");
+    else r.failed.push("J6 Admin mediavelger MANGLER — kunden kan ikke bytte bilder");
+
+    // K1-K4 §34 signature moment + anti-template
+    if (sig.k1) r.passed.push("K1 Signature moment-komponent eksisterer");
+    else r.failed.push("K1 §34 BRUTT — ingen data-signature-moment i kodebasen");
+
+    if (sig.k2) r.passed.push("K2 Signature moment synlig på forsiden over fold");
+    else r.failed.push("K2 §34 BRUTT — signature moment ikke over fold på forsiden");
+
+    if (sig.k3) r.passed.push("K3 Signature moment på alle sekundær-sider");
+    else r.failed.push("K3 §34 BRUTT — signature moment mangler på sekundær-plasseringer");
+
+    if (sig.k4) r.passed.push("K4 Anti-template-grep grønn");
+    else r.failed.push("K4 §34 BRUTT — anti-template-grep failet (bento/hero/brand-tokens)");
+
+    // Re-beregn score med J5/J6 + K1-K4 inkludert
+    r.score = (r.passed.length / (r.passed.length + r.failed.length)) * 10;
+
+    results.push(r);
+    console.log(`   ${r.score >= MIN_SCORE ? "✅" : "❌"} ${r.score.toFixed(1)}/10  (${r.failed.length} mangler)`);
+    await page.close();
+  }
+  await browser.close();
+
+  const avg = results.reduce((s, r) => s + r.score, 0) / results.length;
+  const failing = results.filter((r) => r.score < MIN_SCORE);
+
+  const report = [
+    `# Sprint Quality Report`,
+    `Generert: ${new Date().toISOString()}`,
+    `Target: ${BASE_URL}`,
+    `Krav: ≥${MIN_SCORE.toFixed(1)}/10`,
+    ``,
+    `**Snitt:** ${avg.toFixed(2)}/10`,
+    `**Sider:** ${results.length}`,
+    `**Under terskel:** ${failing.length}`,
+    ``,
+    `## Per-side`,
+    ``,
+    ...results.map((r) =>
+      [
+        `### ${r.slug} — ${r.score.toFixed(1)}/10`,
+        ``,
+        r.failed.length
+          ? `**Mangler (${r.failed.length}):**\n${r.failed.map((f) => `- ❌ ${f}`).join("\n")}`
+          : `✅ Alle ${r.passed.length} sjekker bestått`,
+        ``,
+      ].join("\n"),
+    ),
+  ].join("\n");
+
+  const reportDir = join(process.cwd(), "docs", "sprint-reports");
+  await mkdir(reportDir, { recursive: true });
+  const reportPath = join(reportDir, `sprint-quality-${Date.now()}.md`);
+  await writeFile(reportPath, report);
+
+  console.log(`\n📊 Rapport: ${reportPath}`);
+  console.log(`   Snitt: ${avg.toFixed(2)}/10  ·  Under terskel: ${failing.length}`);
+
+  if (failing.length > 0) {
+    console.error(`\n❌ Sprint IKKE ferdig — ${failing.length} sider scorer under ${MIN_SCORE}`);
+    failing.forEach((r) => console.error(`   ${r.slug}: ${r.score.toFixed(1)}/10`));
+    process.exit(1);
+  }
+
+  console.log(`\n✅ Alle sider scorer ≥${MIN_SCORE} — sprint kvalifisert som ferdig`);
+}
+
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});

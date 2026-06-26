@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# check-no-hardcoding.sh — håndhever §33 «Hardkoding-forbud» (CMS-drevet innhold).
+#
+# Failer hvis koden inneholder:
+#  - Record<slug, ...>-mappings (eks. KEYWORDS, HERO_TITLES, SERVICE_COLORS)
+#  - slug === "/..." conditionals
+#  - Hardkodet <Link href="/..."> i layout/header/footer
+#  - Hardkodet liste av tjenester / kategorier / lokasjoner
+#
+# Brukes i .github/workflows/quality-gate.yml som PR-blokk.
+#
+# Kjør lokalt: bash scripts/check-no-hardcoding.sh
+
+set -e
+EXIT=0
+
+red()    { printf '\033[31m%s\033[0m\n' "$1"; }
+green()  { printf '\033[32m%s\033[0m\n' "$1"; }
+yellow() { printf '\033[33m%s\033[0m\n' "$1"; }
+
+echo "🔍 Sjekker mot hardkoding-forbudet (§33)…"
+echo
+
+# ──────────────────────────────────────────────────────────────
+# 1. Record<slug, ...>-mappings
+# ──────────────────────────────────────────────────────────────
+echo "1) Slug → konfig-mapping (Record<\"/...\", ...>)"
+HITS=$(grep -rnE '^\s*"/[a-zæøå][a-zæøå0-9-]*"\s*:\s*\[' src/ \
+  --include='*.ts' --include='*.tsx' \
+  --exclude-dir=node_modules --exclude-dir=.next \
+  2>/dev/null || true)
+if [ -n "$HITS" ]; then
+  red "❌ Hardkodet slug → liste/array funnet:"
+  echo "$HITS"
+  echo
+  yellow "   → Bruk page_sections.data eller egen tabell. Se dynamic-content.md."
+  EXIT=1
+else
+  green "✅ Ingen slug → konfig-mappings"
+fi
+echo
+
+# ──────────────────────────────────────────────────────────────
+# 2. slug === "/..." conditionals
+# ──────────────────────────────────────────────────────────────
+echo "2) slug === \"/...\" / pathname === \"/...\" conditionals"
+HITS=$(grep -rnE '(slug|pathname)\s*===\s*"/[a-zæøå]' src/ \
+  --include='*.ts' --include='*.tsx' \
+  --exclude-dir=node_modules --exclude-dir=.next \
+  2>/dev/null || true)
+# Filtrer ut aria-current/isActive-sjekker (tillatte) — disse er navigasjon, ikke konfig
+HITS=$(echo "$HITS" | grep -vE 'aria-current|isActive|active=|pathname === item.href' || true)
+if [ -n "$HITS" ]; then
+  red "❌ Side-spesifikk logikk funnet:"
+  echo "$HITS"
+  echo
+  yellow "   → Bruk page_sections.type eller flagg i pages-tabellen."
+  EXIT=1
+else
+  green "✅ Ingen side-spesifikke conditionals"
+fi
+echo
+
+# ──────────────────────────────────────────────────────────────
+# 3. Hardkodet <Link href="/..."> i layout/nav/footer
+# ──────────────────────────────────────────────────────────────
+echo "3) Hardkodet meny-/footer-lenker i layout"
+HITS=$(grep -rnE '<Link[^>]*href="/(om-oss|kontakt|tjenester|faq|nyheter|personvern|vilkar|cookies|tilgjengelighet|blogg|jubileum)"' \
+  src/components/layout/ src/app/\(public\)/layout.tsx 2>/dev/null || true)
+if [ -n "$HITS" ]; then
+  red "❌ Hardkodet menyelement i layout-komponent:"
+  echo "$HITS"
+  echo
+  yellow "   → Bruk pages.eq('show_in_nav', true) i Server Component."
+  EXIT=1
+else
+  green "✅ Ingen hardkodet meny i layout"
+fi
+echo
+
+# ──────────────────────────────────────────────────────────────
+# 4. Hardkodet liste av tjenester / lokasjoner / kategorier
+# ──────────────────────────────────────────────────────────────
+echo "4) Hardkodet array av tjenester / lokasjoner / kategorier"
+HITS=$(grep -rnE 'const (SERVICES|LOCATIONS|CATEGORIES|TJENESTER|STEDER|KATEGORIER)\s*[:=]\s*\[' \
+  src/ --include='*.ts' --include='*.tsx' \
+  --exclude-dir=node_modules --exclude-dir=.next \
+  2>/dev/null || true)
+if [ -n "$HITS" ]; then
+  red "❌ Hardkodet liste over CRUD-data:"
+  echo "$HITS"
+  echo
+  yellow "   → Bruk dedikert tabell i Supabase."
+  EXIT=1
+else
+  green "✅ Ingen hardkodet liste over tjenester/steder/kategorier"
+fi
+echo
+
+# ──────────────────────────────────────────────────────────────
+# 5. KEYWORDS / IMAGE_MAP / HERO_TITLES-pattern
+# ──────────────────────────────────────────────────────────────
+echo "5) KEYWORDS/IMAGE_MAP/HERO_TITLES-mappings"
+HITS=$(grep -rnE 'const (KEYWORDS|IMAGE_MAP|HERO_TITLES|HERO_IMAGES|PAGE_CONFIG|SERVICE_COLORS)\s*[:=]' \
+  src/ scripts/ --include='*.ts' --include='*.tsx' \
+  --exclude-dir=node_modules --exclude-dir=.next \
+  2>/dev/null || true)
+if [ -n "$HITS" ]; then
+  red "❌ Hardkodet side-/bilde-/farge-mapping:"
+  echo "$HITS"
+  echo
+  yellow "   → Engangs-seed med data-drevet heuristikk. Aldri permanent i kode."
+  EXIT=1
+else
+  green "✅ Ingen KEYWORDS/IMAGE_MAP-mappings"
+fi
+echo
+
+if [ "$EXIT" -ne 0 ]; then
+  red "🚫 Hardkoding-forbud (§33) brutt — se output over"
+  red "   Full anti-pattern-guide: docs/standards/06-SECTION_DETAILS/dynamic-content.md"
+  exit 1
+fi
+
+green "✅ Ingen hardkodet CMS-innhold funnet — §33 oppfylt"

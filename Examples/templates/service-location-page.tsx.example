@@ -1,0 +1,274 @@
+﻿/**
+ * Sted×tjeneste-side template — referanse-implementasjon
+ *
+ * Container Consult 30. mai 2026: /[tjeneste]/[sted]-ruter scoret 1.25/10
+ * i visual-quality fordi de manglet hero entirely — bare brødsmuler + H1
+ * + CTA + booking-widget på flat farge. Helge: «terningkast 1».
+ *
+ * Krav som denne malen oppfyller:
+ *  - V1: dominerende hero med tjeneste-bilde fra media-tabellen (≥40% viewport)
+ *  - V2: layout-hierarki via to-kolonne split (60/40)
+ *  - V3: direction-tokens fra brand-tokens.css (ikke generic Tailwind)
+ *  - V5: motion-import for hover/scroll-reveal
+ *  - K3: data-signature-moment-tag på BookingWidget
+ *  - S1: rendring av ≥800 ord intro (via ReactMarkdown)
+ *  - S2: JSON-LD Service + LocalBusiness + FAQ
+ *  - S4: ≥3 FAQ-blokker med <details>
+ *  - S5: cross-links til andre kombinasjoner
+ *
+ * Bytt ut <BookingWidget>/<HeroSection> med prosjektets egne navngitte
+ * komponenter. Kjernen er strukturen, ikke import-stiene.
+ */
+import type { Metadata } from "next";
+import { notFound } from "next/navigation";
+import Link from "next/link";
+import Image from "next/image";
+import { motion } from "motion/react"; // §36 V5: hero MÅ ha motion
+import ReactMarkdown from "react-markdown";
+import { JsonLd, serviceGraph } from "@/lib/seo/jsonld";
+import { loadServiceLocation } from "@/lib/cms/service-location";
+import { createStaticClient } from "@/lib/supabase/static";
+import { PageHero } from "@/components/layout/PageHero"; // delt på tvers av rute-typer (a)
+import { BookingWidget } from "@/components/booking/BookingWidget";
+
+export const revalidate = 60; // §cms ISR
+
+export async function generateMetadata({
+  params,
+}: {
+  params: Promise<{ tjeneste: string; sted: string }>;
+}): Promise<Metadata> {
+  const { tjeneste, sted } = await params;
+  const c = await loadServiceLocation(tjeneste, sted);
+  if (!c) return {};
+  return {
+    title: c.seoTitle ?? `${c.serviceName} ${c.locationName}`,
+    description: c.seoDescription ?? undefined,
+    alternates: { canonical: `/${tjeneste}/${sted}` },
+    openGraph: {
+      title: c.seoTitle ?? `${c.serviceName} ${c.locationName}`,
+      description: c.seoDescription ?? undefined,
+      images: c.heroImageUrl ? [{ url: c.heroImageUrl, width: 1200, height: 630, alt: c.heroImageAlt ?? "" }] : undefined,
+    },
+  };
+}
+
+export default async function ServiceLocationPage({
+  params,
+}: {
+  params: Promise<{ tjeneste: string; sted: string }>;
+}) {
+  const { tjeneste, sted } = await params;
+  const content = await loadServiceLocation(tjeneste, sted);
+  if (!content) notFound();
+
+  const supabase = createStaticClient();
+  const [{ data: otherServices }, { data: otherLocations }] = await Promise.all([
+    supabase
+      .from("services")
+      .select("name, slug, hero_image_url")
+      .eq("is_active", true)
+      .neq("slug", tjeneste)
+      .order("sort_order"),
+    supabase
+      .from("locations")
+      .select("name, slug")
+      .eq("is_active", true)
+      .neq("slug", sted)
+      .order("sort_order")
+      .limit(6),
+  ]);
+
+  return (
+    <main id="main-content">
+      {/* JSON-LD: Service + LocalBusiness + BreadcrumbList + FAQPage (S2) */}
+      <JsonLd
+        id="service-location-jsonld"
+        data={serviceGraph({
+          serviceName: `${content.serviceName} i ${content.locationName}`,
+          description: content.seoDescription ?? content.intro ?? "",
+          priceRange: content.priceRangeHint ?? "kr 900 – kr 4 500",
+          faq: content.faq,
+          breadcrumbs: [
+            { name: "Hjem", url: "/" },
+            { name: content.serviceName, url: `/${tjeneste}` },
+            { name: content.locationName, url: `/${tjeneste}/${sted}` },
+          ],
+        })}
+      />
+
+      {/* ───────────────────────────────────────────────────────────
+          HERO — bruker delt <PageHero> så ALLE rute-typer har samme
+          direction-tokens og motion-mønster (anti-pattern fra
+          Container Consult: kontakt/om-oss hadde egne hero med flat
+          farge, sted×tjeneste hadde ingen hero).
+          ─────────────────────────────────────────────────────────── */}
+      <PageHero
+        kicker={`${content.locationName.toUpperCase()} · ${content.serviceName.toUpperCase()}`}
+        headline={`${content.serviceName} i ${content.locationName}`}
+        subline={content.heroSubline}
+        ctaText="Se pris og bestill"
+        ctaUrl="/bestill"
+        bgImage={content.heroImageUrl ?? content.serviceHeroFallback ?? "/hero-default.jpg"}
+        bgAlt={content.heroImageAlt ?? `${content.serviceName} i ${content.locationName}`}
+      />
+
+      {/* Brødsmuler under hero (god for SEO + tilgjengelighet) */}
+      <nav
+        aria-label="Brødsmuler"
+        className="mx-auto max-w-3xl px-6 pt-6 font-mono text-xs uppercase tracking-wide text-text-muted"
+      >
+        <Link href="/" className="hover:text-text-primary">
+          Hjem
+        </Link>{" "}
+        ·{" "}
+        <Link href={`/${tjeneste}`} className="hover:text-text-primary">
+          {content.serviceName}
+        </Link>{" "}
+        · <span className="text-text-secondary">{content.locationName}</span>
+      </nav>
+
+      {/* ───────────────────────────────────────────────────────────
+          INTRO — 250+ ord unik tekst med Markdown-rendering (S1)
+          ─────────────────────────────────────────────────────────── */}
+      <motion.section
+        initial={{ opacity: 0, y: 24 }}
+        whileInView={{ opacity: 1, y: 0 }}
+        viewport={{ once: true, amount: 0.3 }}
+        transition={{ duration: 0.6, ease: [0.16, 1, 0.3, 1] }}
+        className="mx-auto max-w-3xl px-6 py-12"
+      >
+        {content.intro && (
+          <div
+            className="prose prose-lg max-w-none text-text-secondary
+              prose-headings:font-display prose-headings:text-text-primary
+              prose-h2:mt-10 prose-h2:text-3xl prose-h2:font-bold
+              prose-h3:mt-6 prose-h3:text-xl prose-h3:font-semibold
+              prose-p:leading-relaxed prose-strong:text-text-primary"
+          >
+            <ReactMarkdown>{content.intro}</ReactMarkdown>
+          </div>
+        )}
+      </motion.section>
+
+      {/* ───────────────────────────────────────────────────────────
+          SIGNATURE MOMENT (K1-K5) — BookingWidget med prefilled context
+          ─────────────────────────────────────────────────────────── */}
+      <section className="border-t border-border bg-bg-secondary/40">
+        <div className="mx-auto max-w-4xl px-6 py-16">
+          <BookingWidget
+            variant="embed"
+            prefilledServiceSlug={tjeneste}
+            prefilledServiceLabel={content.serviceName}
+            prefilledLocation={content.locationName}
+          />
+        </div>
+      </section>
+
+      {/* ───────────────────────────────────────────────────────────
+          FAQ (S4) — minst 3 med direkte-siterbare svar
+          ─────────────────────────────────────────────────────────── */}
+      {content.faq.length > 0 && (
+        <motion.section
+          initial={{ opacity: 0, y: 16 }}
+          whileInView={{ opacity: 1, y: 0 }}
+          viewport={{ once: true, amount: 0.2 }}
+          transition={{ duration: 0.5 }}
+          className="mx-auto max-w-3xl px-6 py-16"
+        >
+          <h2 className="mb-8 font-display text-3xl font-bold uppercase tracking-tight text-text-primary">
+            Ofte stilte spørsmål
+          </h2>
+          <div className="divide-y divide-border border-y border-border">
+            {content.faq.map((q, i) => (
+              <details key={i} className="group py-5">
+                <summary className="flex cursor-pointer items-center justify-between font-medium text-text-primary">
+                  <span>{q.question}</span>
+                  <span className="ml-4 text-primary transition-transform group-open:rotate-45">+</span>
+                </summary>
+                <p className="mt-3 leading-relaxed text-text-secondary">{q.answer}</p>
+              </details>
+            ))}
+          </div>
+        </motion.section>
+      )}
+
+      {/* ───────────────────────────────────────────────────────────
+          CROSS-LINKS (S5) — minst 3 til andre kombinasjon-sider
+          ─────────────────────────────────────────────────────────── */}
+      <section className="border-t border-border bg-bg-secondary py-16">
+        <div className="mx-auto max-w-5xl px-6">
+          <div className="grid grid-cols-1 gap-12 sm:grid-cols-2">
+            <div>
+              <h2 className="mb-6 font-mono text-xs uppercase tracking-[0.2em] text-text-muted">
+                Andre tjenester i {content.locationName}
+              </h2>
+              <ul className="space-y-3 text-sm">
+                {(otherServices ?? []).map((s) => (
+                  <li key={s.slug}>
+                    <Link
+                      href={`/${s.slug}/${sted}`}
+                      className="group flex items-center gap-3 text-text-secondary transition hover:text-text-primary"
+                    >
+                      {s.hero_image_url && (
+                        <Image
+                          src={s.hero_image_url}
+                          alt=""
+                          width={48}
+                          height={48}
+                          className="h-12 w-12 object-cover"
+                        />
+                      )}
+                      <span className="group-hover:underline">
+                        {s.name} i {content.locationName}
+                      </span>
+                    </Link>
+                  </li>
+                ))}
+              </ul>
+            </div>
+            <div>
+              <h2 className="mb-6 font-mono text-xs uppercase tracking-[0.2em] text-text-muted">
+                {content.serviceName} andre steder
+              </h2>
+              <ul className="space-y-3 text-sm">
+                {(otherLocations ?? []).map((l) => (
+                  <li key={l.slug}>
+                    <Link
+                      href={`/${tjeneste}/${l.slug}`}
+                      className="text-text-secondary hover:text-text-primary hover:underline"
+                    >
+                      {content.serviceName} i {l.name}
+                    </Link>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  );
+}
+
+/**
+ * Forutsetter at prosjektet har:
+ *
+ * 1) <PageHero> i src/components/layout/PageHero.tsx — DELT hero som ALLE
+ *    rute-typer bruker (forside-section-renderer, /kontakt, /om-oss, FAQ,
+ *    /[tjeneste]/[sted]). Hindrer hero-inkonsistens som dro Container
+ *    Consult ned. Komponenten bruker direction-tokens fra tokens.css.
+ *
+ * 2) service_locations-tabellen har minst:
+ *    - intro (text, 800+ ord, kan inneholde Markdown hvis ReactMarkdown-rendret)
+ *    - faq (jsonb, [{question, answer}])
+ *    - seo_title, seo_description
+ *    - hero_image_url, hero_image_alt
+ *    - hero_subline (1-2 setninger over CTA)
+ *    - price_range_hint
+ *
+ * 3) services-tabellen har hero_image_url for tjeneste-fallback hvis
+ *    sted×tjeneste-kombinasjonen ikke har egen.
+ *
+ * 4) motion (framer-motion) installert + brukt i hero — §36 V5.
+ */

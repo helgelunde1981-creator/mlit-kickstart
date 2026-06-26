@@ -1,0 +1,110 @@
+#!/usr/bin/env node
+/**
+ * Accessibility Check — axe-core mot alle public-ruter.
+ * Krav: 0 critical/serious violations.
+ *
+ * Kjør: pnpm tsx scripts/check-a11y.ts
+ * Krever: BASE_URL kjører, playwright + @axe-core/playwright installert.
+ */
+
+import { chromium, type Browser } from 'playwright'
+import AxeBuilder from '@axe-core/playwright'
+import path from 'node:path'
+
+const BASE_URL = process.env.BASE_URL ?? 'http://localhost:3000'
+
+const ROUTES = [
+  '/',
+  '/om-oss',
+  '/kontakt',
+  '/tjenester',
+  '/blogg',
+  '/personvern',
+  '/tilgjengelighet',
+]
+
+interface RouteResult {
+  route: string
+  critical: number
+  serious: number
+  moderate: number
+  minor: number
+  passed: boolean
+  violations: Array<{ id: string; impact: string; nodes: number }>
+}
+
+async function checkRoute(browser: Browser, route: string): Promise<RouteResult> {
+  const page = await browser.newPage()
+  await page.goto(`${BASE_URL}${route}`, { waitUntil: 'networkidle' })
+
+  const results = await new AxeBuilder({ page })
+    .withTags(['wcag2a', 'wcag2aa', 'wcag22aa'])
+    .analyze()
+
+  await page.close()
+
+  const byImpact = { critical: 0, serious: 0, moderate: 0, minor: 0 }
+  const violations = results.violations.map((v) => {
+    if (v.impact && v.impact in byImpact) byImpact[v.impact as keyof typeof byImpact]++
+    return { id: v.id, impact: v.impact ?? 'unknown', nodes: v.nodes.length }
+  })
+
+  return {
+    route,
+    ...byImpact,
+    violations,
+    passed: byImpact.critical === 0 && byImpact.serious === 0,
+  }
+}
+
+async function main(): Promise<void> {
+  const browser = await chromium.launch()
+  const results: RouteResult[] = []
+
+  for (const route of ROUTES) {
+    try {
+      results.push(await checkRoute(browser, route))
+    } catch (e) {
+      console.error(`Route ${route} crashed:`, e)
+    }
+  }
+
+  await browser.close()
+
+  const failed = results.filter((r) => !r.passed)
+  const totalCritical = results.reduce((sum, r) => sum + r.critical, 0)
+  const totalSerious = results.reduce((sum, r) => sum + r.serious, 0)
+
+  const report = {
+    timestamp: new Date().toISOString(),
+    baseUrl: BASE_URL,
+    totalCritical,
+    totalSerious,
+    results,
+    passed: failed.length === 0,
+  }
+
+  const outDir = path.join(process.cwd(), 'reports/a11y')
+  const fs = await import('node:fs/promises')
+  await fs.mkdir(outDir, { recursive: true })
+  await fs.writeFile(path.join(outDir, 'summary.json'), JSON.stringify(report, null, 2))
+
+  if (failed.length === 0) {
+    console.log(`✓ A11y OK — ${results.length} ruter, 0 critical/serious violations`)
+    return
+  }
+
+  console.error(`✗ A11y FAILED — ${totalCritical} critical + ${totalSerious} serious violations`)
+  for (const r of failed) {
+    console.error(`  ${r.route}  critical=${r.critical}  serious=${r.serious}`)
+    for (const v of r.violations.filter((v) => v.impact === 'critical' || v.impact === 'serious')) {
+      console.error(`    [${v.impact}] ${v.id} (${v.nodes} nodes)`)
+    }
+  }
+  process.exit(1)
+}
+
+main().catch((e) => {
+  console.error('check-a11y crashed:', e)
+  process.exit(2)
+})

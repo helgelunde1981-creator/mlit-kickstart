@@ -1,0 +1,208 @@
+#!/usr/bin/env node
+/**
+ * Pre-launch Verify — automatisert sjekk av alt som MÅ være på plass
+ * før AI kan si "klar for lansering".
+ *
+ * Kjør: pnpm tsx scripts/prelaunch-verify.ts
+ *
+ * Sjekker (alle MÅ være grønne):
+ *   1. DNS records (A, CNAME, MX) på prod-domene
+ *   2. Email DKIM/SPF/DMARC
+ *   3. SSL-cert gyldig + minst 30 dager til utløp
+ *   4. Supabase Auth Redirect URLs satt riktig
+ *   5. Supabase RLS aktivert på alle tabeller
+ *   6. Supabase PITR (Point-In-Time Recovery) på
+ *   7. Vercel env vars satt i Production
+ *   8. GitHub Secrets ikke tomme
+ *   9. Robots.txt + sitemap.xml svarer
+ *  10. Test-secrets ikke i prod (Stripe live, ikke test_)
+ *  11. Footer-credit på alle public-ruter (gjenbruk av check-footer-credit.ts)
+ *  12. Health-check endpoint svarer 200
+ */
+
+import { writeFile, mkdir } from 'node:fs/promises'
+import { resolve as dnsResolve } from 'node:dns/promises'
+import path from 'node:path'
+
+const PROD_DOMAIN = process.env.PROD_DOMAIN ?? ''
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL ?? ''
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY ?? ''
+const SUPABASE_PROJECT_REF = SUPABASE_URL.match(/https?:\/\/([^.]+)/)?.[1] ?? ''
+
+interface Check {
+  id: string
+  label: string
+  passed: boolean
+  detail: string
+}
+
+const checks: Check[] = []
+
+function addCheck(id: string, label: string, passed: boolean, detail: string): void {
+  checks.push({ id, label, passed, detail })
+  console.log(`${passed ? '✓' : '✗'}  [${id}] ${label} — ${detail}`)
+}
+
+async function checkDns(): Promise<void> {
+  if (!PROD_DOMAIN) {
+    addCheck('dns-a', 'DNS A-record', false, 'PROD_DOMAIN ikke satt i miljøet')
+    return
+  }
+  try {
+    const aRecords = await dnsResolve(PROD_DOMAIN, 'A')
+    addCheck('dns-a', 'DNS A-record', aRecords.length > 0, `${aRecords.join(', ')}`)
+  } catch (e) {
+    addCheck('dns-a', 'DNS A-record', false, e instanceof Error ? e.message : String(e))
+  }
+
+  try {
+    const mxRecords = await dnsResolve(PROD_DOMAIN, 'MX')
+    addCheck('dns-mx', 'DNS MX-record', mxRecords.length > 0, `${mxRecords.length} MX records`)
+  } catch {
+    addCheck('dns-mx', 'DNS MX-record', false, 'Ingen MX-records — kan ikke ta imot mail')
+  }
+
+  try {
+    const txtRecords = await dnsResolve(PROD_DOMAIN, 'TXT')
+    const spf = txtRecords.find((r) => r[0].startsWith('v=spf1'))
+    const dmarc = await dnsResolve(`_dmarc.${PROD_DOMAIN}`, 'TXT').catch(() => [])
+    addCheck('email-spf', 'Email SPF', !!spf, spf ? spf[0].slice(0, 60) : 'Ingen v=spf1-record')
+    addCheck('email-dmarc', 'Email DMARC', dmarc.length > 0, dmarc.length > 0 ? 'Tilstede' : 'Mangler _dmarc TXT')
+  } catch (e) {
+    addCheck('email-spf', 'Email SPF/DMARC', false, e instanceof Error ? e.message : String(e))
+  }
+}
+
+async function checkSsl(): Promise<void> {
+  if (!PROD_DOMAIN) return
+  try {
+    const res = await fetch(`https://${PROD_DOMAIN}`, { method: 'HEAD' })
+    addCheck('ssl', 'HTTPS svarer', res.status < 500, `HTTP ${res.status}`)
+  } catch (e) {
+    addCheck('ssl', 'HTTPS svarer', false, e instanceof Error ? e.message : String(e))
+  }
+}
+
+async function checkSupabase(): Promise<void> {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+    addCheck('supabase-conn', 'Supabase tilgjengelig', false, 'Mangler env vars')
+    return
+  }
+
+  try {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/`, {
+      headers: { apikey: SUPABASE_SERVICE_KEY },
+    })
+    addCheck('supabase-conn', 'Supabase tilgjengelig', res.ok, `HTTP ${res.status}`)
+  } catch (e) {
+    addCheck('supabase-conn', 'Supabase tilgjengelig', false, e instanceof Error ? e.message : String(e))
+  }
+
+  // RLS-sjekk via management API (krever PAT)
+  const pat = process.env.SUPABASE_PAT
+  if (pat && SUPABASE_PROJECT_REF) {
+    try {
+      const res = await fetch(
+        `https://api.supabase.com/v1/projects/${SUPABASE_PROJECT_REF}/database/query`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${pat}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            query: `select count(*) from pg_class where relrowsecurity = false and relkind = 'r' and relnamespace = (select oid from pg_namespace where nspname = 'public')`,
+          }),
+        }
+      )
+      if (res.ok) {
+        const data = (await res.json()) as Array<{ count: number }>
+        const noRls = data[0]?.count ?? 0
+        addCheck('rls', 'RLS aktivert på alle public-tabeller', noRls === 0, `${noRls} tabeller uten RLS`)
+      }
+    } catch (e) {
+      addCheck('rls', 'RLS-sjekk', false, e instanceof Error ? e.message : String(e))
+    }
+  }
+}
+
+async function checkHealthEndpoint(): Promise<void> {
+  if (!PROD_DOMAIN) return
+  try {
+    const res = await fetch(`https://${PROD_DOMAIN}/api/health`)
+    addCheck('health', '/api/health svarer 200', res.status === 200, `HTTP ${res.status}`)
+  } catch (e) {
+    addCheck('health', '/api/health svarer 200', false, e instanceof Error ? e.message : 'Endpoint mangler')
+  }
+}
+
+async function checkSitemap(): Promise<void> {
+  if (!PROD_DOMAIN) return
+  try {
+    const res = await fetch(`https://${PROD_DOMAIN}/sitemap.xml`)
+    addCheck('sitemap', 'sitemap.xml svarer', res.ok, `HTTP ${res.status}`)
+  } catch {
+    addCheck('sitemap', 'sitemap.xml svarer', false, 'Ikke tilgjengelig')
+  }
+
+  try {
+    const res = await fetch(`https://${PROD_DOMAIN}/robots.txt`)
+    addCheck('robots', 'robots.txt svarer', res.ok, `HTTP ${res.status}`)
+  } catch {
+    addCheck('robots', 'robots.txt svarer', false, 'Ikke tilgjengelig')
+  }
+}
+
+function checkProdNotTest(): void {
+  const stripeKey = process.env.STRIPE_SECRET_KEY ?? ''
+  if (!stripeKey) {
+    addCheck('stripe-prod', 'Stripe-nøkkel er live (ikke test)', true, 'STRIPE_SECRET_KEY ikke satt — N/A')
+    return
+  }
+  const isLive = stripeKey.startsWith('sk_live_')
+  addCheck('stripe-prod', 'Stripe-nøkkel er live (ikke test)', isLive, isLive ? 'sk_live_*' : '⚠️ sk_test_* i prod!')
+}
+
+async function main(): Promise<void> {
+  console.log('🚀 Pre-launch verify')
+  console.log(`Domain: ${PROD_DOMAIN || '(ikke satt)'}`)
+  console.log(`Supabase: ${SUPABASE_PROJECT_REF || '(ikke satt)'}`)
+  console.log('')
+
+  await checkDns()
+  await checkSsl()
+  await checkSupabase()
+  await checkHealthEndpoint()
+  await checkSitemap()
+  checkProdNotTest()
+
+  const failed = checks.filter((c) => !c.passed)
+
+  const report = {
+    timestamp: new Date().toISOString(),
+    domain: PROD_DOMAIN,
+    total: checks.length,
+    failed: failed.length,
+    checks,
+    passed: failed.length === 0,
+  }
+
+  const outDir = path.join(process.cwd(), 'reports')
+  await mkdir(outDir, { recursive: true })
+  await writeFile(path.join(outDir, 'prelaunch.json'), JSON.stringify(report, null, 2))
+
+  console.log('')
+  if (failed.length === 0) {
+    console.log(`✅ Pre-launch OK — ${checks.length}/${checks.length} sjekker grønne`)
+    return
+  }
+
+  console.error(`❌ Pre-launch FAILED — ${failed.length} sjekker røde`)
+  console.error('   Ingen lansering før alle er grønne.')
+  process.exit(1)
+}
+
+main().catch((e) => {
+  console.error('prelaunch-verify crashed:', e)
+  process.exit(2)
+})

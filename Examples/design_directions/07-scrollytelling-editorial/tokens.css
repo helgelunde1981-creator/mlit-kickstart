@@ -1,0 +1,91 @@
+/* Scrollytelling Editorial — Tokens */
+
+:root {
+  --color-bg: oklch(99% 0.005 80);
+  --color-surface-1: oklch(96% 0.005 80);
+  --color-surface-2: oklch(92% 0.008 80);
+  --color-surface-dark: oklch(10% 0.01 80);
+
+  --color-text-primary: oklch(15% 0.005 80);
+  --color-text-secondary: oklch(40% 0.005 80);
+  --color-text-muted: oklch(60% 0.005 80);
+  --color-text-inverse: oklch(99% 0.005 80);
+
+  /* Brand — editorial-strong, overstyres per prosjekt */
+  --color-accent-primary: oklch(45% 0.2 25);     /* deep red */
+  --color-accent-secondary: oklch(75% 0.15 60);  /* warm amber */
+
+  --color-success: oklch(55% 0.18 145);
+  --color-error: oklch(55% 0.22 25);
+
+  --color-border-subtle: oklch(15% 0.005 80 / 0.08);
+  --color-border-strong: oklch(15% 0.005 80 / 0.2);
+
+  /* Type — editorial serif + sans body */
+  --font-sans: 'Inter', system-ui, sans-serif;
+  --font-display: 'Tiempos Headline', 'Playfair Display', Georgia, serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+
+  --text-xs: 0.75rem;
+  --text-sm: 0.875rem;
+  --text-base: 1.125rem;                  /* litt større body for lesbarhet */
+  --text-lg: 1.375rem;
+  --text-xl: 1.875rem;
+  --text-2xl: 2.5rem;
+  --text-3xl: 3.5rem;
+  --text-hero: clamp(3.5rem, 2rem + 7vw, 7rem);
+
+  --leading-tight: 1.1;
+  --leading-snug: 1.3;
+  --leading-normal: 1.6;
+  --leading-relaxed: 1.8;        /* mer luft for long-form */
+
+  --tracking-tight: -0.03em;
+  --tracking-normal: 0;
+  --tracking-wide: 0.05em;
+
+  /* Spacing — generøs for breathing room */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-4: 1rem;
+  --space-8: 2rem;
+  --space-12: 3rem;
+  --space-16: 4rem;
+  --space-24: 6rem;
+  --space-32: 8rem;
+  --space-section: clamp(6rem, 5rem + 8vw, 14rem);   /* large stages */
+
+  /* Radius — minimal */
+  --radius-sm: 0;
+  --radius-md: 0.25rem;
+  --radius-lg: 0.5rem;
+  --radius-full: 9999px;
+
+  /* Shadow */
+  --shadow-sm: 0 1px 2px 0 oklch(0% 0 0 / 0.05);
+  --shadow-md: 0 4px 12px 0 oklch(0% 0 0 / 0.1);
+  --shadow-lg: 0 16px 40px 0 oklch(0% 0 0 / 0.15);
+
+  /* Motion — gradual, narrative-driven */
+  --duration-fast: 200ms;
+  --duration-normal: 500ms;
+  --duration-slow: 1000ms;
+  --duration-stage: 1500ms;
+
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-out-circ: cubic-bezier(0, 0.55, 0.45, 1);
+
+  /* Layout */
+  --container-prose: 62ch;
+  --container-default: 1200px;
+  --container-wide: 1440px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --duration-fast: 0ms;
+    --duration-normal: 0ms;
+    --duration-slow: 0ms;
+    --duration-stage: 0ms;
+  }
+}

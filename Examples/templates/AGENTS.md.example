@@ -1,0 +1,141 @@
+﻿# AGENTS.md — {{client_name}}
+
+> Denne fila er kontrakten mellom prosjektet og enhver AI-agent (Claude, Codex, Cursor, etc.) som åpner kodebasen.
+> **Les den ferdig før du gjør noe.**
+
+## 1. Før du gjør noe (obligatorisk lese-rekkefølge)
+
+1. **`PROJECT.md`** i prosjekt-roten — full spec (20 seksjoner)
+2. **`~/.claude/projects/c--Github-{{repo_name}}/memory/MEMORY.md`** — prosjekt-spesifikke memories
+3. **`~/.claude/CLAUDE.md`** — Helge's globale preferanser
+4. **`~/Documents/GitHub/CLAUDE.md`** — globale verktøy-tilganger (Supabase, Vercel, Resend, n8n, GitHub Secrets)
+5. **`docs/standards/`** (hvis kopiert lokalt) — kvalitetskrav og section-details
+
+Hvis du hopper over noen av disse, kommer du til å gjette på noe som allerede er bestemt. Det er forbudt.
+
+## 2. Source-of-truth-hierarki
+
+Når regler kolliderer, denne rekkefølgen vinner (spesifikk overstyrer generisk):
+
+```
+PROJECT.md (dette prosjektets spec)
+  ↓ overstyrer
+docs/standards/06-SECTION_DETAILS/ (kvalitetsregler)
+  ↓ overstyrer
+docs/standards/04-QUALITY_GATES.md (terskler)
+  ↓ overstyrer
+~/.claude/projects/.../memory/ (prosjekt-memories)
+  ↓ overstyrer
+~/.claude/CLAUDE.md (globale Helge-regler)
+  ↓ overstyrer
+default Next.js / Tailwind / Supabase conventions
+```
+
+## 3. Aldri-listen (krasjer prosjektet eller Mac)
+
+- ✅ **Dev-server er OK å starte** — `pnpm dev` / `next dev` med `run_in_background: true`. Den tidligere "aldri start"-regelen ble trukket tilbake 2026-05-30 fordi den blokkerte normal iterasjon. Hvis serveren faktisk henger eller Mac begynner å bli treg: kill med `KillShell` umiddelbart og rapporter — men ikke nekt å starte den.
+- ❌ **ALDRI** kjør `supabase db push` lokalt mot prod
+  - Migrasjoner går KUN via `.github/workflows/supabase-migrations.yml`
+- ❌ **ALDRI** force-push til `main` eller `dev`
+- ❌ **ALDRI** commit `.env`, `.env.local`, eller noen fil med secrets
+- ✅ **MCP er OK** for Supabase — men verifiser ALLTID riktig prosjekt først (`list_projects`/`get_project` mot `.env`); CLI bruker `--project-ref`
+- ❌ **ALDRI** be Helge gjøre noe selv hvis du har tilgang via CLI/API
+
+## 4. Sjekk-først-listen (før du tror noe er nytt)
+
+Før du bygger noe nytt, sjekk om det finnes:
+
+- **Komponenter:** `grep -r "function ComponentNavn" src/components/`
+- **Utility-funksjoner:** `grep -r "export function" src/lib/`
+- **DB-tabeller:** `ls supabase/migrations/`
+- **Mønstre:** `grep -r "<patternName>" src/`
+- **Eposter:** `ls emails/`
+- **Sider:** `ls src/app/`
+
+90% av tiden finnes det allerede. Ikke duplikat.
+
+**GDPR-behandlingsprotokoll (vedlikehold):** Når du legger til en ny underdatabehandler/tredjepartstjeneste
+(SaaS, API, hosting, analyse, e-post, betaling, chat), en ny datatype/formål, eller en ny funksjon som
+behandler persondata (auth, skjema, nyhetsbrev, betaling, medlem/påmelding, booking, e-signering) — oppdater
+master-protokollen i SAMME slengen og speil i personvern:
+`~/Documents/GitHub/mlit/docs/compliance/Behandlingsprotokoll-MLITDrift.md`
+(single source of truth — aldri dupliser inn her). Si fra at du gjorde det.
+
+**Cookiebot (vedlikehold):** Legger du til et nytt cookie-/tracker-settende script — særlig bak innlogging
+(dashboard/admin/min side), etter brukerhandling, eller server-/first-party (auth, CSRF, rate-limit,
+Turnstile) — MÅ det registreres manuelt i Cookiebot → «Manually added cookies and trackers» med riktig
+kategori. Cookiebots auto-scanner ser kun offentlige sider og fanger det IKKE.
+
+## 5. Stack-snapshot
+
+| Lag | Valg |
+|-----|------|
+| Frontend | {{frontend_choice}} |
+| Backend | {{backend_choice}} |
+| Auth | {{auth_provider}} |
+| DB | Supabase Postgres + RLS |
+| Email | Resend (designede HTML via react-email) |
+| Hosting | Vercel (team myrvoll-lunde-it-drift-s-projects) |
+| Tests | Vitest + Playwright + axe-core |
+
+## 6. Conventions
+
+### Branch-flyt
+- All utvikling på `dev`
+- `main` deployer til prod (Vercel)
+- Aldri commit direkte til `main` — alltid PR fra `dev`
+
+### Commit-format
+```
+<type>: <kort beskrivelse på norsk>
+
+<body>
+```
+Types: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`, `perf`, `ci`
+
+### Migrasjons-filer
+- Format: `supabase/migrations/YYYYMMDDHHMMSS_kort_beskrivelse.sql`
+- Generer ALLTID med `npx supabase migration new <navn>` (ikke håndlagd)
+- Idempotent (CREATE IF NOT EXISTS, DROP IF EXISTS, etc.)
+
+### Secrets
+Hver secret skal være på 3 steder:
+1. `.env.local` (lokalt, gitignored)
+2. Vercel env (Production + Preview + Development)
+3. GitHub Actions secrets
+
+**🚨 KRITISK — bruk `printf`, IKKE `echo`, når du setter secrets:**
+
+```bash
+# ❌ FEIL — echo legger til \n som blir med inn i env-vars og bryter API-er
+echo "value" | npx vercel env add MY_TOKEN production --token "$TOKEN"
+
+# ✅ RIKTIG — printf gir ingen newline
+printf "value" | npx vercel env add MY_TOKEN production --token "$TOKEN"
+```
+
+Denne bugen har skapt mye trøbbel (Supabase: `400 Invalid slug`, GitHub: `401 Bad credentials`). Trim alltid env-vars i koden også: `process.env.MY_TOKEN?.trim()`.
+
+## 7. Quality gates
+
+Hver PR til `main` kjøres mot `.github/workflows/quality-gate.yml`:
+- Lighthouse ≥ 95 alle 4 kategorier
+- axe-core: 0 critical/serious
+- CMS-coverage: 0 hardkodet kundetekst
+- Footer-credit på alle public-ruter
+- Alle email-templates rendrer
+- 0 broken internal links
+
+Hvis noe er rødt, fiks det FØR du sier "ferdig".
+
+## 8. Når noe er uklart
+
+1. Sjekk PROJECT.md
+2. Sjekk memory
+3. Sjekk standardene
+4. Sjekk koden (grep)
+5. Spør Helge — IKKE GJETT
+
+---
+
+> Oppdatert: {{today}}. Dette dokumentet skal alltid være på linje med PROJECT.md.

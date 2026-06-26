@@ -1,0 +1,116 @@
+#!/usr/bin/env node
+/**
+ * Broken Links Check — crawl sitemap.xml + intern lenker, sjekk at alle
+ * returnerer 2xx eller 3xx (ikke 4xx/5xx).
+ *
+ * Kjør: pnpm tsx scripts/check-broken-links.ts
+ */
+
+import path from 'node:path'
+import { writeFile, mkdir } from 'node:fs/promises'
+
+const BASE_URL = process.env.BASE_URL ?? 'http://localhost:3000'
+
+interface LinkCheck {
+  url: string
+  status: number
+  ok: boolean
+  source: string
+}
+
+async function fetchSitemap(): Promise<string[]> {
+  const res = await fetch(`${BASE_URL}/sitemap.xml`)
+  if (!res.ok) {
+    console.warn(`sitemap.xml ikke tilgjengelig (${res.status}) — bruker fallback-ruter`)
+    return ['/', '/om-oss', '/kontakt', '/tjenester']
+  }
+  const xml = await res.text()
+  const matches = [...xml.matchAll(/<loc>([^<]+)<\/loc>/g)]
+  return matches.map((m) => m[1].replace(BASE_URL, ''))
+}
+
+async function extractLinksFromPage(url: string): Promise<string[]> {
+  try {
+    const res = await fetch(`${BASE_URL}${url}`)
+    if (!res.ok) return []
+    const html = await res.text()
+    const matches = [...html.matchAll(/href="([^"]+)"/g)]
+    return matches
+      .map((m) => m[1])
+      .filter((href) => href.startsWith('/') && !href.startsWith('//'))
+      .filter((href, idx, arr) => arr.indexOf(href) === idx)
+  } catch {
+    return []
+  }
+}
+
+async function checkUrl(url: string, source: string): Promise<LinkCheck> {
+  try {
+    const fullUrl = url.startsWith('http') ? url : `${BASE_URL}${url}`
+    const res = await fetch(fullUrl, { method: 'HEAD', redirect: 'follow' })
+    return {
+      url,
+      status: res.status,
+      ok: res.status >= 200 && res.status < 400,
+      source,
+    }
+  } catch {
+    return { url, status: 0, ok: false, source }
+  }
+}
+
+async function main(): Promise<void> {
+  const sitemapRoutes = await fetchSitemap()
+  console.log(`Fant ${sitemapRoutes.length} ruter i sitemap`)
+
+  const linksToCheck = new Set<string>(sitemapRoutes)
+  const sources = new Map<string, string>()
+  sitemapRoutes.forEach((r) => sources.set(r, 'sitemap.xml'))
+
+  // Krys-sjekk hver sitemap-side for interne lenker
+  for (const route of sitemapRoutes.slice(0, 20)) {
+    const internal = await extractLinksFromPage(route)
+    for (const link of internal) {
+      if (!linksToCheck.has(link)) {
+        linksToCheck.add(link)
+        sources.set(link, route)
+      }
+    }
+  }
+
+  const results: LinkCheck[] = []
+  for (const url of linksToCheck) {
+    results.push(await checkUrl(url, sources.get(url) ?? 'unknown'))
+  }
+
+  const broken = results.filter((r) => !r.ok)
+
+  const report = {
+    timestamp: new Date().toISOString(),
+    baseUrl: BASE_URL,
+    totalChecked: results.length,
+    broken: broken.length,
+    results: results.slice(0, 200),
+    passed: broken.length === 0,
+  }
+
+  const outDir = path.join(process.cwd(), 'reports')
+  await mkdir(outDir, { recursive: true })
+  await writeFile(path.join(outDir, 'broken-links.json'), JSON.stringify(report, null, 2))
+
+  if (broken.length === 0) {
+    console.log(`✓ Broken links OK — ${results.length} lenker sjekket, 0 broken`)
+    return
+  }
+
+  console.error(`✗ Broken links FAILED — ${broken.length}/${results.length} broken`)
+  for (const r of broken.slice(0, 20)) {
+    console.error(`  ${r.status} ${r.url}  (fra ${r.source})`)
+  }
+  process.exit(1)
+}
+
+main().catch((e) => {
+  console.error('check-broken-links crashed:', e)
+  process.exit(2)
+})

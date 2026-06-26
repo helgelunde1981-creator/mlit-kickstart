@@ -1,0 +1,319 @@
+﻿/**
+ * check-wizard-coverage.ts — håndhever §35 «Wizard = Kontrakt».
+ *
+ * Leser kickstart_projects-raden fra mlit-Supabase + verifiserer
+ * mot kodebasen at HVERT satt felt har sin leveranse:
+ *  - W1: Tech-stack installert + minst én import
+ *  - W2: Integrasjoner installert + ENV satt + minst én bruk
+ *  - W3: requires_*-flagg har konkret implementasjon
+ *  - W4: Design-coverage (color/font/motion)
+ *
+ * Brukes i .github/workflows/quality-gate.yml som PR-blokk.
+ *
+ * Env (set i CI):
+ *   KICKSTART_SUPABASE_URL — mlit-DB-URL
+ *   KICKSTART_SUPABASE_SERVICE_KEY
+ *   KICKSTART_PROJECT_ID — UUID for dette prosjektets kickstart-row
+ *
+ * Kjør lokalt:
+ *   pnpm tsx scripts/check-wizard-coverage.ts
+ */
+import { createClient } from "@supabase/supabase-js";
+import { readFile, access } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+
+const URL = process.env.KICKSTART_SUPABASE_URL?.trim();
+const KEY = process.env.KICKSTART_SUPABASE_SERVICE_KEY?.trim();
+const ID = process.env.KICKSTART_PROJECT_ID?.trim();
+
+if (!URL || !KEY || !ID) {
+  console.error("Mangler KICKSTART_SUPABASE_URL / KICKSTART_SUPABASE_SERVICE_KEY / KICKSTART_PROJECT_ID");
+  process.exit(1);
+}
+
+const supabase = createClient(URL, KEY, { auth: { persistSession: false } });
+
+interface KickstartProject {
+  frontend_stack: string[];
+  backend_stack: string[];
+  integrations: string[];
+  mobile_stack: string[];
+  hosting_infra: string[];
+  auth_type: string[];
+  requires_seo: boolean;
+  requires_gdpr: boolean;
+  requires_a11y: boolean;
+  requires_scrape: boolean;
+  requires_supabase_branching: boolean;
+  requires_e2e: boolean;
+  requires_rate_limiting: boolean;
+  requires_rls: boolean;
+  requires_audit_log: boolean;
+  requires_dark_mode: boolean;
+  design_style: string[];
+  color_primary: string | null;
+  color_secondary: string | null;
+  font_preference: string[];
+  motion_preference: string[];
+  pages_structure: string | null;
+}
+
+const { data: project, error } = await supabase
+  .from("kickstart_projects")
+  .select("*")
+  .eq("id", ID)
+  .single();
+
+if (error || !project) {
+  console.error(`Fant ikke kickstart_project ${ID}: ${error?.message}`);
+  process.exit(1);
+}
+
+const p = project as KickstartProject;
+
+const pkg = JSON.parse(await readFile("package.json", "utf-8"));
+const allDeps = { ...pkg.dependencies, ...pkg.devDependencies };
+
+const failures: string[] = [];
+const passed: string[] = [];
+
+const fileExists = async (path: string): Promise<boolean> => {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const grepCount = (pattern: string, paths: string[]): number => {
+  const result = spawnSync("grep", ["-rE", pattern, ...paths], { encoding: "utf-8" });
+  if (result.status !== 0 && result.status !== 1) return 0;
+  return (result.stdout ?? "").split("\n").filter(Boolean).length;
+};
+
+const grepFiles = (pattern: string, paths: string[]): string[] => {
+  const result = spawnSync("grep", ["-rlE", pattern, ...paths], { encoding: "utf-8" });
+  if (result.status !== 0 && result.status !== 1) return [];
+  return (result.stdout ?? "").split("\n").filter(Boolean);
+};
+
+// ─── W1: Tech-stack ──────────────────────────────────────────
+const TECH_PKG_MAP: Record<string, string[]> = {
+  "Next.js 15": ["next"],
+  "Next.js": ["next"],
+  "React": ["react"],
+  "Vite": ["vite"],
+  "Expo (React Native)": ["expo"],
+  "TypeScript": ["typescript"],
+  "Tailwind CSS": ["tailwindcss"],
+  "shadcn/ui": ["@radix-ui/react-dialog", "@radix-ui/react-popover", "@radix-ui/react-toast"],
+  "Framer Motion": ["motion", "framer-motion"],
+  "GSAP": ["gsap"],
+  "Zustand": ["zustand"],
+  "TanStack Query": ["@tanstack/react-query"],
+  "Recharts": ["recharts"],
+  "Zod": ["zod"],
+  "React Hook Form": ["react-hook-form"],
+  "Supabase": ["@supabase/supabase-js", "@supabase/ssr"],
+  "PostgreSQL": ["@supabase/supabase-js", "pg"],
+  "Prisma": ["@prisma/client"],
+  "Upstash Redis": ["@upstash/redis", "@upstash/ratelimit"],
+  "Vercel": [],
+  "GitHub Actions": [],
+  "Playwright": ["@playwright/test", "playwright"],
+  "Vitest": ["vitest"],
+};
+
+const allTech = [
+  ...p.frontend_stack,
+  ...p.backend_stack,
+  ...p.mobile_stack,
+  ...p.hosting_infra,
+];
+const techMissing: string[] = [];
+
+for (const tech of allTech) {
+  const expected = TECH_PKG_MAP[tech];
+  if (!expected || expected.length === 0) continue;
+  const installed = expected.some((pkg) => allDeps[pkg]);
+  if (!installed) techMissing.push(`${tech} (forventet: ${expected.join(" / ")})`);
+}
+
+if (techMissing.length > 0) {
+  failures.push(`W1: Tech-stack mangler: ${techMissing.join(", ")}`);
+} else {
+  passed.push("W1: Tech-stack installert");
+}
+
+// ─── W2: Integrasjoner ───────────────────────────────────────
+const INTEGRATION_MAP: Record<string, { pkg: string | string[]; envVars: string[] }> = {
+  "Stripe": { pkg: "stripe", envVars: ["STRIPE_SECRET_KEY"] },
+  "Vipps": { pkg: ["@vippsmobilepay/checkout-sdk", "axios"], envVars: ["VIPPS_CLIENT_ID"] },
+  "Resend": { pkg: "resend", envVars: ["RESEND_API_KEY"] },
+  "Twilio SMS": { pkg: "twilio", envVars: ["TWILIO_ACCOUNT_SID"] },
+  "Claude API": { pkg: "@anthropic-ai/sdk", envVars: ["ANTHROPIC_API_KEY"] },
+  "OpenAI": { pkg: "openai", envVars: ["OPENAI_API_KEY"] },
+  "Gemini": { pkg: "@google/generative-ai", envVars: ["GEMINI_API_KEY"] },
+  "Google Maps/Places": { pkg: "@googlemaps/js-api-loader", envVars: ["NEXT_PUBLIC_GOOGLE_MAPS_API_KEY"] },
+  "Cloudflare Turnstile": { pkg: "@marsidev/react-turnstile", envVars: ["TURNSTILE_SITE_KEY"] },
+  "PostHog": { pkg: "posthog-js", envVars: ["NEXT_PUBLIC_POSTHOG_KEY"] },
+  "Plausible": { pkg: "next-plausible", envVars: ["NEXT_PUBLIC_PLAUSIBLE_DOMAIN"] },
+  "Sentry": { pkg: "@sentry/nextjs", envVars: ["SENTRY_DSN"] },
+  "GA4": { pkg: "", envVars: ["NEXT_PUBLIC_GA_ID"] }, // bruker next/script
+  "GTM": { pkg: "", envVars: ["NEXT_PUBLIC_GTM_ID"] },
+  "Vercel Analytics": { pkg: "@vercel/analytics", envVars: [] },
+  "Cloudinary": { pkg: "next-cloudinary", envVars: ["CLOUDINARY_URL"] },
+  "TipTap": { pkg: "@tiptap/react", envVars: [] },
+  "Meta Pixel": { pkg: "", envVars: ["NEXT_PUBLIC_META_PIXEL_ID"] },
+  "Tripletex": { pkg: "axios", envVars: ["TRIPLETEX_CONSUMER_TOKEN"] },
+};
+
+const integrationFailures: string[] = [];
+
+for (const integration of p.integrations) {
+  const map = INTEGRATION_MAP[integration];
+  if (!map) continue; // ukjent — skip
+  const pkgs = Array.isArray(map.pkg) ? map.pkg : [map.pkg];
+  if (pkgs.some(Boolean)) {
+    const installed = pkgs.some((pkg) => allDeps[pkg]);
+    if (!installed) integrationFailures.push(`${integration} → ${pkgs.join("/")} ikke installert`);
+  }
+  for (const env of map.envVars) {
+    if (!process.env[env]) integrationFailures.push(`${integration} → ${env} ikke satt`);
+  }
+}
+
+if (integrationFailures.length > 0) {
+  failures.push(`W2: Integrasjoner: ${integrationFailures.join("; ")}`);
+} else {
+  passed.push("W2: Integrasjoner OK");
+}
+
+// ─── W3: Krav-coverage ───────────────────────────────────────
+const reqFailures: string[] = [];
+
+if (p.requires_seo) {
+  const hasSitemap = (await fileExists("src/app/sitemap.ts")) || (await fileExists("public/sitemap.xml"));
+  const hasRobots = (await fileExists("src/app/robots.ts")) || (await fileExists("public/robots.txt"));
+  if (!hasSitemap) reqFailures.push("requires_seo: ingen sitemap");
+  if (!hasRobots) reqFailures.push("requires_seo: ingen robots");
+}
+
+if (p.requires_gdpr) {
+  // Consent = Cookiebot. Egen banner er FORBUDT — vi skal finne Cookiebot, ikke en CookieBanner.
+  const hasCookiebot =
+    grepCount("cookiebot\\.com|data-cbid|Cookiebot", ["src/"]) > 0;
+  if (!hasCookiebot)
+    reqFailures.push("requires_gdpr: Cookiebot mangler (script/data-cbid). Spør Helge om CBID.");
+
+  // Forbud mot egen consent-modul
+  const hasOwnBanner =
+    (await fileExists("src/components/CookieBanner.tsx")) ||
+    (await fileExists("src/components/layout/CookieBanner.tsx")) ||
+    grepCount("CookieBanner|cookieConsent|cookie_consents", ["src/"]) > 0;
+  if (hasOwnBanner)
+    reqFailures.push("requires_gdpr: egen cookie-banner/consent funnet — FORBUDT, bruk Cookiebot");
+
+  // Cookiebot-domener MÅ være i CSP (middleware.ts eller next.config.ts)
+  const hasCspCookiebot =
+    grepCount("consent\\.cookiebot\\.com", ["src/middleware.ts", "next.config.ts"]) > 0;
+  if (!hasCspCookiebot)
+    reqFailures.push("requires_gdpr: Cookiebot-domener mangler i CSP (script-src + connect-src)");
+}
+
+if (p.requires_e2e) {
+  const hasE2E =
+    (await fileExists("tests/e2e")) ||
+    (await fileExists("e2e")) ||
+    (await fileExists("playwright/tests")) ||
+    grepCount("@playwright/test", ["tests/", "e2e/"]) > 0;
+  if (!hasE2E) reqFailures.push("requires_e2e: ingen E2E-tester");
+}
+
+if (p.requires_rate_limiting) {
+  const hasRateLimit = grepCount("@upstash/ratelimit|ratelimit\\.limit", ["src/"]) > 0;
+  if (!hasRateLimit) reqFailures.push("requires_rate_limiting: ingen ratelimit-bruk");
+}
+
+if (p.requires_dark_mode) {
+  const hasToggle = grepCount("data-theme|ThemeToggle|next-themes", ["src/"]) > 0;
+  if (!hasToggle) reqFailures.push("requires_dark_mode: ingen theme-toggle");
+}
+
+if (p.requires_audit_log) {
+  // Krever DB-sjekk mot prosjekt-Supabase — heuristikk via migrasjon-fil
+  const hasAuditMigration =
+    grepCount("create table.*audit_log|create table.*audit\\b", ["supabase/migrations/"]) > 0;
+  if (!hasAuditMigration) reqFailures.push("requires_audit_log: ingen audit_log-tabell i migrasjoner");
+}
+
+if (p.requires_scrape) {
+  const hasScrapeScript = await fileExists("scripts/scrape-existing-site.ts");
+  if (!hasScrapeScript) reqFailures.push("requires_scrape: scripts/scrape-existing-site.ts mangler");
+}
+
+if (reqFailures.length > 0) {
+  failures.push(`W3: Krav-coverage: ${reqFailures.join("; ")}`);
+} else {
+  passed.push("W3: requires_*-flagg har implementasjon");
+}
+
+// ─── W4: Design-coverage ─────────────────────────────────────
+const designFailures: string[] = [];
+
+if (p.color_primary) {
+  const tokensFile = await readFile("src/styles/tokens.css", "utf-8").catch(() => "");
+  if (!tokensFile.includes("--color-primary")) {
+    designFailures.push("color_primary valgt men --color-primary mangler i tokens.css");
+  } else {
+    const usageCount = grepCount("bg-primary|text-primary|var\\(--color-primary", ["src/"]);
+    if (usageCount < 3) designFailures.push(`color_primary i tokens men kun brukt ${usageCount} ganger (krav: ≥3)`);
+  }
+}
+
+if (p.font_preference?.length > 0) {
+  const layoutFile = await readFile("src/app/layout.tsx", "utf-8").catch(() => "");
+  if (!layoutFile.includes("next/font")) {
+    designFailures.push("font_preference satt men next/font ikke importert i layout.tsx");
+  }
+}
+
+if (p.motion_preference?.[0] && !p.motion_preference[0].toLowerCase().startsWith("statisk")) {
+  const motionLibs = ["motion", "framer-motion", "gsap"];
+  const installed = motionLibs.some((lib) => allDeps[lib]);
+  if (!installed) {
+    designFailures.push(`motion_preference="${p.motion_preference[0]}" men ingen motion-bibliotek installert (forventet: motion eller gsap)`);
+  } else {
+    const motionUsage = grepCount("from ['\"](motion/react|framer-motion|gsap)", ["src/"]);
+    if (motionUsage < 3) {
+      designFailures.push(`motion-bibliotek installert men kun importert i ${motionUsage} fil(er) — krav: ≥3 for ikke-statisk preferanse`);
+    }
+  }
+}
+
+if (p.design_style?.length > 0) {
+  const antiTemplateResult = spawnSync("bash", ["scripts/check-anti-template.sh"], { encoding: "utf-8" });
+  if (antiTemplateResult.status !== 0) {
+    designFailures.push("design_style satt men check-anti-template.sh failet (se output)");
+  }
+}
+
+if (designFailures.length > 0) {
+  failures.push(`W4: Design: ${designFailures.join("; ")}`);
+} else {
+  passed.push("W4: Design-coverage OK");
+}
+
+// ─── Rapport ─────────────────────────────────────────────────
+console.log(`\n🧾 Wizard-coverage-rapport for ${ID}\n`);
+passed.forEach((p) => console.log(`   ✅ ${p}`));
+
+if (failures.length > 0) {
+  console.error(`\n❌ ${failures.length}/4 W-kategorier brutt:`);
+  failures.forEach((f) => console.error(`   ${f}`));
+  console.error(`\n   Full kravsmatrise: docs/standards/06-SECTION_DETAILS/wizard-coverage.md`);
+  process.exit(1);
+}
+
+console.log("\n✅ Alle wizard-leveranser verifisert (§35 oppfylt)");

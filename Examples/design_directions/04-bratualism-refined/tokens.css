@@ -1,0 +1,92 @@
+/* Brutalism Refined — Tokens */
+
+:root {
+  --color-bg: oklch(96% 0.02 90);                 /* warm cream */
+  --color-surface-1: oklch(100% 0 0);
+  --color-surface-2: oklch(92% 0.02 90);
+  --color-surface-card: oklch(100% 0 0);
+
+  --color-text-primary: oklch(8% 0 0);            /* near-black */
+  --color-text-secondary: oklch(20% 0 0);
+  --color-text-muted: oklch(40% 0 0);
+  --color-text-inverse: oklch(96% 0.02 90);
+
+  /* Brand — bold block-farger */
+  --color-accent-primary: oklch(65% 0.25 30);     /* electric orange-red */
+  --color-accent-secondary: oklch(85% 0.2 100);   /* yellow */
+  --color-accent-tertiary: oklch(60% 0.2 250);    /* electric blue */
+
+  --color-success: oklch(60% 0.22 145);
+  --color-error: oklch(55% 0.25 25);
+
+  /* Borders — thick */
+  --color-border-default: oklch(8% 0 0);          /* black */
+  --color-border-subtle: oklch(8% 0 0 / 0.2);
+
+  /* Type — monospace forward */
+  --font-sans: 'Space Grotesk', 'Inter', system-ui, sans-serif;
+  --font-display: 'Space Mono', 'JetBrains Mono', ui-monospace, monospace;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+
+  --text-xs: 0.75rem;
+  --text-sm: 0.875rem;
+  --text-base: 1rem;
+  --text-lg: 1.25rem;
+  --text-xl: 1.875rem;
+  --text-2xl: 2.5rem;
+  --text-3xl: 3.5rem;
+  --text-hero: clamp(3.5rem, 2rem + 7vw, 8rem);
+
+  --leading-tight: 1.05;
+  --leading-normal: 1.5;
+
+  --tracking-tight: -0.02em;
+  --tracking-normal: 0;
+  --tracking-wide: 0.06em;
+
+  /* Spacing */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-4: 1rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+  --space-12: 3rem;
+  --space-16: 4rem;
+  --space-24: 6rem;
+  --space-section: clamp(4rem, 3rem + 5vw, 8rem);
+
+  /* Radius — none, brutal */
+  --radius-sm: 0;
+  --radius-md: 0;
+  --radius-lg: 0;
+  --radius-xl: 0;
+  --radius-full: 9999px;
+
+  /* Shadow — HARD offset, no blur */
+  --shadow-sm: 2px 2px 0 0 var(--color-border-default);
+  --shadow-md: 4px 4px 0 0 var(--color-border-default);
+  --shadow-lg: 8px 8px 0 0 var(--color-border-default);
+  --shadow-xl: 12px 12px 0 0 var(--color-border-default);
+
+  /* Border-widths */
+  --border-default: 2px;
+  --border-strong: 3px;
+
+  /* Motion — snappy */
+  --duration-fast: 100ms;
+  --duration-normal: 200ms;
+  --duration-slow: 400ms;
+  --ease-snap: cubic-bezier(0.85, 0, 0.15, 1);     /* sharp easing */
+  --ease-out: cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* Layout */
+  --container-default: 1200px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --duration-fast: 0ms;
+    --duration-normal: 0ms;
+    --duration-slow: 0ms;
+  }
+}

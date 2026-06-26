@@ -1,0 +1,97 @@
+/* Retro-Futurism — Tokens */
+
+:root {
+  --color-bg: oklch(8% 0.02 280);                 /* deep purple-black */
+  --color-surface-1: oklch(12% 0.04 280);
+  --color-surface-2: oklch(16% 0.06 280);
+
+  --color-text-primary: oklch(95% 0.05 280);
+  --color-text-secondary: oklch(75% 0.1 280);
+  --color-text-muted: oklch(50% 0.05 280);
+
+  /* Neon accents */
+  --color-accent-primary: oklch(75% 0.25 320);    /* hot pink/magenta */
+  --color-accent-secondary: oklch(85% 0.2 180);   /* cyan */
+  --color-accent-tertiary: oklch(80% 0.2 100);    /* yellow */
+  --color-accent-glow: oklch(75% 0.25 320 / 0.5);
+
+  --color-success: oklch(85% 0.25 145);
+  --color-error: oklch(70% 0.3 25);
+
+  --color-border-subtle: oklch(95% 0.05 280 / 0.1);
+  --color-border-strong: oklch(95% 0.05 280 / 0.3);
+
+  /* Type — monospace forward */
+  --font-sans: 'JetBrains Mono', 'IBM Plex Mono', ui-monospace, monospace;
+  --font-display: 'VT323', 'IBM Plex Mono', monospace;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+
+  --text-xs: 0.75rem;
+  --text-sm: 0.875rem;
+  --text-base: 1rem;
+  --text-lg: 1.25rem;
+  --text-xl: 1.75rem;
+  --text-2xl: 2.5rem;
+  --text-3xl: 3.5rem;
+  --text-hero: clamp(3rem, 1.5rem + 7vw, 8rem);
+
+  --leading-tight: 1.1;
+  --leading-normal: 1.5;
+  --leading-relaxed: 1.7;
+
+  --tracking-tight: 0;
+  --tracking-normal: 0.02em;
+  --tracking-wide: 0.1em;
+  --tracking-mono: 0.15em;
+
+  /* Spacing */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-4: 1rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+  --space-12: 3rem;
+  --space-16: 4rem;
+  --space-24: 6rem;
+  --space-section: clamp(4rem, 3rem + 5vw, 8rem);
+
+  /* Radius — sharp */
+  --radius-sm: 0;
+  --radius-md: 0.125rem;
+  --radius-lg: 0.25rem;
+  --radius-xl: 0.5rem;
+  --radius-full: 9999px;
+
+  /* Shadow — neon glow */
+  --shadow-sm: 0 0 4px 0 var(--color-accent-primary);
+  --shadow-md: 0 0 12px 0 var(--color-accent-glow);
+  --shadow-lg: 0 0 24px 0 var(--color-accent-glow), 0 0 48px 0 var(--color-accent-glow);
+  --shadow-neon-cyan: 0 0 12px 0 var(--color-accent-secondary);
+  --shadow-neon-yellow: 0 0 12px 0 var(--color-accent-tertiary);
+
+  /* Motion */
+  --duration-fast: 100ms;
+  --duration-normal: 200ms;
+  --duration-slow: 400ms;
+  --ease-snap: cubic-bezier(0.85, 0, 0.15, 1);
+  --ease-out: cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* CRT-effects */
+  --scanline-gradient: repeating-linear-gradient(
+    180deg,
+    transparent 0,
+    transparent 2px,
+    oklch(0% 0 0 / 0.15) 2px,
+    oklch(0% 0 0 / 0.15) 4px
+  );
+
+  --container-default: 1200px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --duration-fast: 0ms;
+    --duration-normal: 0ms;
+    --duration-slow: 0ms;
+  }
+}
