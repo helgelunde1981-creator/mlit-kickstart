@@ -44,3 +44,35 @@ Filene er nummererte fordi rekkefølgen er meningsbærende — de leses i denne 
 - @03-TECH_STACK_CANON.md — standardstacken
 - @04-QUALITY_GATES.md — definisjonen av ferdig
 - @CONTRIBUTING.md — branch og commit
+
+## Felles sikkerhetsstandard (innført 04.11.2026)
+
+Gjelder alle Helges repoer. Selve workflowene (Gitleaks, Supabase-sjekker) og
+migrasjonene kommer som egne PR-er fra den som eier standarden. Ikke lag dem
+selv, og ikke skriv om dem når de er kommet.
+
+**Gjelder allerede nå:**
+
+- **Actions pinnes til full SHA.** Hver ny `uses:` i en workflow skrives med
+  full 40-tegns commit-SHA og versjonskommentar, f.eks.
+  `uses: actions/checkout@<40 tegn> # v5`. Aldri `@v5`, `@main` eller kort SHA.
+  Renovate pinner eksisterende linjer. Pin-PR-ene automerges og skal ikke
+  lukkes. En GitHub-regel som feiler workflows med upinnede actions kommer senere.
+- **Genererte filer redigeres ikke for hånd.** Filer med headeren «generert»
+  (bl.a. `supabase/tests/database/0N-*.test.sql`) endres bare av generatoren.
+  Drift-sjekken feiler hvis de er endret.
+
+**Kommer med standard-PR-en:**
+
+- **Gitleaks på alle PR-er.** Finner den en hemmelighet i en ny commit, blir
+  PR-en rød. Da: roter nøkkelen først (den kan være live), fjern den fra koden,
+  og si fra til Helge. Offentlige verdier (`NEXT_PUBLIC_*`, `VITE_*`,
+  anon-nøkkelen, Sentry DSN) gir ikke varsel.
+- Sjekkene rapporterer bare i en prøveperiode, og blir deretter påkrevde i
+  branch protection. Helge får beskjed før det slås på.
+
+**Uendret:**
+
+- Grenflyten slik den står beskrevet for repoet: PR, grønn CI, merge til `dev`,
+  verifiser, så `main` (der repoet har `dev`). Ingen force push til `main` eller
+  `dev`.
